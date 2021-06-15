@@ -31,6 +31,9 @@
 #include "console-server.h"
 
 #define EXIT_ESCAPE 2
+// decimal values for the below values 169 150 230
+const char* status_char_sequence = "\xa9\x96\xe6";
+bool write_tunnel_status = false;
 
 enum process_rc {
 	PROCESS_OK = 0,
@@ -95,6 +98,32 @@ static enum process_rc process_ssh_tty(
 				return PROCESS_ERR;
 			out_buf = &buf[i+1];
 			break;
+		case '\\':
+                        if (esc_state->state == 'g') {
+			        break;
+                        }
+			esc_state->state = '\\';
+			break;
+		case 'g':
+			if (esc_state->state != '\\') {
+				esc_state->state = '\0';
+				break;
+			}
+			esc_state->state = 'g';
+                        break;
+		case '@':
+			if (esc_state->state != 'g') {
+				esc_state->state = '\0';
+				break;
+			}
+			/* Print the status character */
+			rc = write_buf_to_fd(
+				client->fd_out, (const uint8_t *)status_char_sequence, strlen(status_char_sequence));
+			if (rc < 0)
+				return PROCESS_ERR;
+                        write_tunnel_status = true;
+			esc_state->state = '\0';
+                        return PROCESS_OK;
 		case '\r':
 			esc_state->state = '\r';
 			break;
@@ -345,8 +374,12 @@ int main(int argc, char *argv[])
 		if (pollfds[0].revents)
 			prc = process_tty(client);
 
-		if (prc == PROCESS_OK && pollfds[1].revents)
+		if (!write_tunnel_status && prc == PROCESS_OK && pollfds[1].revents)
 			prc = process_console(client);
+
+                if(write_tunnel_status) {
+                        write_tunnel_status = false;
+                }
 
 		rc = (prc == PROCESS_ERR) ? -1 : 0;
 		if (prc != PROCESS_OK)
