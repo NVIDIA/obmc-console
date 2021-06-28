@@ -75,6 +75,7 @@ static enum process_rc process_ssh_tty(
 	struct ssh_esc_state *esc_state = &client->esc_state.ssh;
 	const uint8_t *out_buf = buf;
 	int rc;
+        uint8_t countEsc = 0;
 
 	for (size_t i = 0; i < len; ++i) {
 		switch (buf[i])
@@ -98,21 +99,37 @@ static enum process_rc process_ssh_tty(
 				return PROCESS_ERR;
 			out_buf = &buf[i+1];
 			break;
+		case '\r':
+			esc_state->state = '\r';
+			break;
+                //sequence \\g\\@ will be tracked for tunnel status in the below code.
 		case '\\':
                         if (esc_state->state == 'g') {
-			        break;
+                            if(countEsc > 0) {
+                                esc_state->state = '\0';
+                                countEsc = 0;
+                            }
+                            else {
+                                 countEsc++;
+                            }
+                            break;
                         }
+                        countEsc++;
 			esc_state->state = '\\';
 			break;
 		case 'g':
-			if (esc_state->state != '\\') {
+			if (esc_state->state != '\\' ||
+                              (esc_state->state == '\\' && countEsc > 1)) {
 				esc_state->state = '\0';
+                                countEsc = 0;
 				break;
 			}
 			esc_state->state = 'g';
+                        countEsc = 0;
                         break;
 		case '@':
-			if (esc_state->state != 'g') {
+			if (esc_state->state != 'g' ||
+                              (esc_state->state == 'g' && !countEsc)) {
 				esc_state->state = '\0';
 				break;
 			}
@@ -124,9 +141,6 @@ static enum process_rc process_ssh_tty(
                         write_tunnel_status = true;
 			esc_state->state = '\0';
                         return PROCESS_OK;
-		case '\r':
-			esc_state->state = '\r';
-			break;
 		default:
 			esc_state->state = '\0';
 		}
