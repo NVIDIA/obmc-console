@@ -66,6 +66,36 @@ struct handler {
 
 int console_data_out(struct console *console, const uint8_t *data, size_t len);
 
+enum escape_state {
+	escape_idle = 0,
+	escape_cr,
+	escape_lf,
+	escape_leader,
+};
+
+struct console {
+	const char	*tty_kname;
+	char		*tty_sysfs_devnode;
+	char		*tty_dev;
+	int		tty_sirq;
+	int		tty_lpc_addr;
+	speed_t		tty_baud;
+	int		tty_fd;
+
+	struct ringbuffer	*rb;
+
+	struct handler	**handlers;
+	int		n_handlers;
+
+	struct poller	**pollers;
+	int		n_pollers;
+
+	struct pollfd	*pollfds;
+	struct sd_bus	*bus;
+
+	enum escape_state state;
+};
+
 /* poller API */
 struct poller;
 
