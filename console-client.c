@@ -32,7 +32,7 @@
 
 #define EXIT_ESCAPE 2
 // decimal values for the below values 169 150 230
-const char* status_char_sequence = "\xa9\x96\xe6";
+const char *status_char_sequence = "\xa9\x96\xe6";
 bool write_tunnel_status = false;
 
 enum process_rc {
@@ -75,7 +75,7 @@ static enum process_rc process_ssh_tty(struct console_client *client,
 	struct ssh_esc_state *esc_state = &client->esc_state.ssh;
 	const uint8_t *out_buf = buf;
 	int rc;
-        uint8_t countEsc = 0;
+	uint8_t countEsc = 0;
 
 	for (size_t i = 0; i < len; ++i) {
 		switch (buf[i]) {
@@ -102,46 +102,47 @@ static enum process_rc process_ssh_tty(struct console_client *client,
 		case '\r':
 			esc_state->state = '\r';
 			break;
-                //sequence \\g\\@ will be tracked for tunnel status in the below code.
+		//sequence \\g\\@ will be tracked for tunnel status in the below code.
 		case '\\':
-                        if (esc_state->state == 'g') {
-                            if(countEsc > 0) {
-                                esc_state->state = '\0';
-                                countEsc = 0;
-                            }
-                            else {
-                                 countEsc++;
-                            }
-                            break;
-                        }
-                        countEsc++;
+			if (esc_state->state == 'g') {
+				if (countEsc > 0) {
+					esc_state->state = '\0';
+					countEsc = 0;
+				} else {
+					countEsc++;
+				}
+				break;
+			}
+			countEsc++;
 			esc_state->state = '\\';
 			break;
 		case 'g':
 			if (esc_state->state != '\\' ||
-                              (esc_state->state == '\\' && countEsc > 1)) {
+			    (esc_state->state == '\\' && countEsc > 1)) {
 				esc_state->state = '\0';
-                                countEsc = 0;
+				countEsc = 0;
 				break;
 			}
 			esc_state->state = 'g';
-                        countEsc = 0;
-                        break;
+			countEsc = 0;
+			break;
 		case '@':
 			if (esc_state->state != 'g' ||
-                              (esc_state->state == 'g' && !countEsc)) {
+			    (esc_state->state == 'g' && !countEsc)) {
 				esc_state->state = '\0';
 				break;
 			}
 			/* Print the status character */
 			rc = write_buf_to_fd(
-				client->fd_out, (const uint8_t *)status_char_sequence, strlen(status_char_sequence));
+				client->fd_out,
+				(const uint8_t *)status_char_sequence,
+				strlen(status_char_sequence));
 			if (rc < 0) {
 				return PROCESS_ERR;
-            }
-                        write_tunnel_status = true;
+			}
+			write_tunnel_status = true;
 			esc_state->state = '\0';
-                        return PROCESS_OK;
+			return PROCESS_OK;
 		default:
 			esc_state->state = '\0';
 		}
@@ -416,8 +417,8 @@ int main(int argc, char *argv[])
 				write_tunnel_status = false;
 		}
 
-		if(write_tunnel_status) {
-				write_tunnel_status = false;
+		if (write_tunnel_status) {
+			write_tunnel_status = false;
 		}
 
 		rc = (prc == PROCESS_ERR) ? -1 : 0;
