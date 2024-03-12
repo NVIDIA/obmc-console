@@ -136,8 +136,9 @@ static enum process_rc process_ssh_tty(struct console_client *client,
 			/* Print the status character */
 			rc = write_buf_to_fd(
 				client->fd_out, (const uint8_t *)status_char_sequence, strlen(status_char_sequence));
-			if (rc < 0)
+			if (rc < 0) {
 				return PROCESS_ERR;
+            }
                         write_tunnel_status = true;
 			esc_state->state = '\0';
                         return PROCESS_OK;
