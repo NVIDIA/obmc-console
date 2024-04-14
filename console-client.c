@@ -413,10 +413,6 @@ int main(int argc, char *argv[])
 			prc = process_console(client);
 		}
 
-		if(write_tunnel_status) {
-				write_tunnel_status = false;
-		}
-
 		if (write_tunnel_status) {
 			write_tunnel_status = false;
 		}
