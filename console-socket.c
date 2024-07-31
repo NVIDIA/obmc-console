@@ -65,6 +65,10 @@ ssize_t console_socket_path_readable(const struct sockaddr_un *addr,
 	}
 
 	len = addrlen - sizeof(addr->sun_family) - 1;
+	if (len > sizeof(socket_path_t) - 1) {
+		return -EINVAL;
+	}
+
 	memcpy(path, src + sizeof(addr->sun_family) + 1, len);
 	path[len] = '\0';
 
