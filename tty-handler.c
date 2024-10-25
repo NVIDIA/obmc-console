@@ -126,6 +126,10 @@ static int tty_drain_queue(struct tty_handler *th, size_t force_len)
 			return -1;
 		}
 
+		if (total_len > SIZE_MAX - wlen) {
+			warn("data size too large to write; disabling");
+			return -1;
+		}
 		total_len += wlen;
 
 		if (force_len && total_len >= force_len) {
