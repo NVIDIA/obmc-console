@@ -136,6 +136,10 @@ static struct config *config_init_fd(int fd, const char *filename)
 		}
 		len += rc;
 		if (len == size) {
+			if (size > SIZE_MAX >> 1) {
+				warn("File %s is too large to read.", filename);
+				goto out_free;
+			}
 			size <<= 1;
 			buf = realloc(buf, size + 1);
 		}
