@@ -98,22 +98,7 @@ enum tty_device {
 	TTY_DEVICE_PTY,
 };
 
-<<<<<<< HEAD
-enum escape_state {
-	escape_idle = 0,
-	escape_cr,
-	escape_lf,
-	escape_leader,
-};
-
-/* Console server structure */
-struct console {
-||||||| b7dddbc
-/* Console server structure */
-struct console {
-=======
 struct console_server {
->>>>>>> origin/master
 	struct {
 		const char *kname;
 		char *dev;
@@ -176,18 +161,8 @@ struct console {
 	struct poller **pollers;
 	long n_pollers;
 
-<<<<<<< HEAD
-	struct pollfd *pollfds;
-	struct sd_bus *bus;
-
-	enum escape_state state;
-||||||| b7dddbc
-	struct pollfd *pollfds;
-	struct sd_bus *bus;
-=======
 	// values to configure the mux
 	unsigned long mux_index;
->>>>>>> origin/master
 };
 
 /* poller API */
