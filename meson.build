@@ -65,6 +65,7 @@ server = executable('obmc-console-server',
            'socket-handler.c',
            'tty-handler.c',
            'util.c',
+           log_handler_sources,
            c_args: [
              '-DLOCALSTATEDIR="@0@"'.format(get_option('localstatedir')),
              '-DSYSCONFDIR="@0@"'.format(get_option('sysconfdir'))
