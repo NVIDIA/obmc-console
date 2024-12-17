@@ -52,16 +52,21 @@ if udev.found()
                install_dir: udev.get_variable('udevdir') / 'rules.d')
 endif
 
+log_handler_sources = []
+if get_option('console-log')
+  log_handler_sources += 'log-handler.c'
+endif
+
 executable('obmc-console-server',
            'config.c',
            'console-dbus.c',
            'console-server.c',
            'console-socket.c',
-           'log-handler.c',
            'ringbuffer.c',
            'socket-handler.c',
            'tty-handler.c',
            'util.c',
+           log_handler_sources,
            c_args: [
              '-DLOCALSTATEDIR="@0@"'.format(get_option('localstatedir')),
              '-DSYSCONFDIR="@0@"'.format(get_option('sysconfdir'))
