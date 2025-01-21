@@ -30,6 +30,7 @@
 #include <sys/un.h>
 #include <systemd/sd-daemon.h>
 
+#include "console-mux.h"
 #include "console-server.h"
 
 #define SOCKET_HANDLER_PKT_SIZE 512
@@ -97,8 +98,13 @@ static void client_close(struct client *client)
 	/* NOLINTBEGIN(bugprone-sizeof-expression) */
 	memmove(&sh->clients[idx], &sh->clients[idx + 1],
 		sizeof(*sh->clients) * (sh->n_clients - idx));
-	sh->clients =
-		reallocarray(sh->clients, sh->n_clients, sizeof(*sh->clients));
+	if (sh->n_clients == 0) {
+		free(sh->clients);
+		sh->clients = NULL;
+	} else {
+		sh->clients = reallocarray(sh->clients, sh->n_clients,
+					   sizeof(*sh->clients));
+	}
 	/* NOLINTEND(bugprone-sizeof-expression) */
 }
 
@@ -260,119 +266,6 @@ client_timeout(struct handler *handler __attribute__((unused)), void *data)
 	return POLLER_OK;
 }
 
-static uint8_t *process_buffer_range(struct socket_handler *sh, uint8_t *begin,
-				     uint8_t *end)
-{
-	static const uint8_t tilde = '~';
-	uint8_t *cursor = NULL;
-
-	/* Caller to enforce */
-	assert(begin < end);
-
-	/*
-	 * SSH-style escape sequence handling: <newline><leader><descriminator>
-	 *
-	 * This may look like:
-	 *
-	 * - \n~B
-	 * - \r~B
-	 * - \r\n~B
-	 * - \n~~
-	 * - etc
-	 */
-	switch (sh->console->state) {
-	case escape_idle:
-		/* Handle \r, \n, and \r\n by searching for \r first */
-		if ((cursor = memchr(begin, '\r', end - begin))) {
-			sh->console->state = escape_cr;
-			/* Include the newline in the output */
-			cursor += 1;
-		} else if ((cursor = memchr(begin, '\n', end - begin))) {
-			sh->console->state = escape_lf;
-			/* Include the newline in the output */
-			cursor += 1;
-		} else {
-			cursor = end;
-		}
-		console_data_out(sh->console, begin, cursor - begin);
-		return cursor;
-	case escape_cr:
-		cursor = begin;
-		switch (*cursor) {
-		case '\n':
-			/* Ensure \r\n new line sequences are emitted too */
-			sh->console->state = escape_lf;
-			cursor++;
-			console_data_out(sh->console, begin, cursor - begin);
-			return cursor;
-		case '~':
-			sh->console->state = escape_leader;
-			cursor++;
-			return cursor;
-		default:
-			/* Emit the current character on the following invocation */
-			sh->console->state = escape_idle;
-			return cursor;
-		}
-		assert(false);
-		break;
-	case escape_lf:
-		cursor = begin;
-		switch (*cursor) {
-		case '~':
-			sh->console->state = escape_leader;
-			cursor++;
-			return cursor;
-		default:
-			/* Emit the current character on the following invocation */
-			sh->console->state = escape_idle;
-			return cursor;
-		}
-		assert(false);
-		break;
-	case escape_leader:
-		/*
-		 * Either:
-		 *
-		 * 1. It's a known escape and we handle it, then return to the idle state,
-		 *    or,
-		 * 2. It's an unknown escape sequence and we pass through the characters,
-		 *    then return to the idle state
-		 *
-		 * Whatever the case, we end up in the idle state. Set that first to avoid
-		 * complexities in the code paths that follow.
-		 */
-		sh->console->state = escape_idle;
-		cursor = begin;
-		switch (*cursor) {
-		/* Escape sequence for a UART break signal */
-		case 'B':
-			tcsendbreak(sh->console->tty.fd, 0);
-			cursor++;
-			return cursor;
-
-		/* Escape sequence for emitting a tilde */
-		case '~':
-			/* Emit the tilde already in the buffer on the following invocation */
-			return cursor;
-
-		/* Unrecognised escape sequence */
-		default:
-			/*
-			 * Emit the consumed tilde now. Emit the unrecognised escape
-			 * discriminator (current character) on the following invocation.
-			 */
-			console_data_out(sh->console, &tilde, 1);
-			return cursor;
-		}
-		assert(false);
-		break;
-	}
-	fprintf(stderr, "Programming error: Reached default return in %s\n",
-		__func__);
-	return NULL;
-}
-
 static enum poller_ret client_poll(struct handler *handler, int events,
 				   void *data)
 {
@@ -395,12 +288,7 @@ static enum poller_ret client_poll(struct handler *handler, int events,
 			goto err_close;
 		}
 
-		assert(rc >= 0 && (size_t)rc <= sizeof(buf));
-		uint8_t *end = buf + rc;
-		uint8_t *begin = buf;
-		while (begin && begin < end) {
-			begin = process_buffer_range(sh, begin, end);
-		}
+		console_data_out(sh->console, buf, rc);
 	}
 
 	if (events & POLLOUT) {
@@ -435,6 +323,8 @@ static enum poller_ret socket_poll(struct handler *handler, int events,
 	if (fd < 0) {
 		return POLLER_OK;
 	}
+
+	console_mux_activate(sh->console);
 
 	client = malloc(sizeof(*client));
 	memset(client, 0, sizeof(*client));
@@ -475,7 +365,7 @@ int dbus_create_socket_consumer(struct console *console)
 	int n;
 
 	for (i = 0; i < console->n_handlers; i++) {
-		if (strcmp(console->handlers[i]->name, "socket") == 0) {
+		if (strcmp(console->handlers[i]->type->name, "socket") == 0) {
 			sh = to_socket_handler(console->handlers[i]);
 			break;
 		}
@@ -536,14 +426,22 @@ close_fds:
 	return rc;
 }
 
-static int socket_init(struct handler *handler, struct console *console,
-		       struct config *config __attribute__((unused)))
+static struct handler *socket_init(const struct handler_type *type
+				   __attribute__((unused)),
+				   struct console *console,
+				   struct config *config
+				   __attribute__((unused)))
 {
-	struct socket_handler *sh = to_socket_handler(handler);
+	struct socket_handler *sh;
 	struct sockaddr_un addr;
 	size_t addrlen;
 	ssize_t len;
 	int rc;
+
+	sh = malloc(sizeof(*sh));
+	if (!sh) {
+		return NULL;
+	}
 
 	sh->console = console;
 	sh->clients = NULL;
@@ -558,7 +456,7 @@ static int socket_init(struct handler *handler, struct console *console,
 		} else {
 			warn("Socket name length exceeds buffer limits");
 		}
-		return -1;
+		goto err_free;
 	}
 
 	/* Try to take a socket from systemd first */
@@ -570,7 +468,7 @@ static int socket_init(struct handler *handler, struct console *console,
 		sh->sd = socket(AF_UNIX, SOCK_STREAM, 0);
 		if (sh->sd < 0) {
 			warn("Can't create socket");
-			return -1;
+			goto err_free;
 		}
 
 		addrlen = sizeof(addr) - sizeof(addr.sun_path) + len;
@@ -581,23 +479,37 @@ static int socket_init(struct handler *handler, struct console *console,
 			console_socket_path_readable(&addr, addrlen, name);
 			warn("Can't bind to socket path %s (terminated at first null)",
 			     name);
-			goto cleanup;
+			goto err_close;
 		}
 
 		rc = listen(sh->sd, 1);
 		if (rc) {
 			warn("Can't listen for incoming connections");
-			goto cleanup;
+			goto err_close;
 		}
 	}
 
-	sh->poller = console_poller_register(console, handler, socket_poll,
+	sh->poller = console_poller_register(console, &sh->handler, socket_poll,
 					     NULL, sh->sd, POLLIN, NULL);
 
-	return 0;
-cleanup:
+	return &sh->handler;
+
+err_close:
 	close(sh->sd);
-	return -1;
+err_free:
+	free(sh);
+	return NULL;
+}
+
+static void socket_deselect(struct handler *handler)
+{
+	struct socket_handler *sh = to_socket_handler(handler);
+
+	while (sh->n_clients) {
+		struct client *c = sh->clients[0];
+		client_drain_queue(c, 0);
+		client_close(c);
+	}
 }
 
 static void socket_fini(struct handler *handler)
@@ -613,14 +525,14 @@ static void socket_fini(struct handler *handler)
 	}
 
 	close(sh->sd);
+	free(sh);
 }
 
-static struct socket_handler socket_handler = {
-	.handler = {
-		.name		= "socket",
-		.init		= socket_init,
-		.fini		= socket_fini,
-	},
+static const struct handler_type socket_handler = {
+	.name = "socket",
+	.init = socket_init,
+	.deselect = socket_deselect,
+	.fini = socket_fini,
 };
 
-console_handler_register(&socket_handler.handler);
+console_handler_register(&socket_handler);

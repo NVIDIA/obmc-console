@@ -38,7 +38,10 @@
 #include <sys/socket.h>
 #include <poll.h>
 
+#include "console-mux.h"
+
 #include "console-server.h"
+#include "config.h"
 
 #define DEV_PTS_PATH "/dev/pts"
 
@@ -46,7 +49,7 @@
 const size_t default_buffer_size = 128ul * 1024ul;
 
 /* state shared with the signal handler */
-static bool sigint;
+static volatile sig_atomic_t sigint;
 
 static void usage(const char *progname)
 {
@@ -60,8 +63,78 @@ static void usage(const char *progname)
 		progname);
 }
 
-/* populates console->tty.dev and console->tty.sysfs_devnode, using the tty kernel name */
-static int tty_find_device(struct console *console)
+static bool console_server_pollfd_reclaimable(struct pollfd *p)
+{
+	return p->fd == -1 && p->events == 0 && p->revents == ~0;
+}
+
+static ssize_t
+console_server_find_released_pollfd(struct console_server *server)
+{
+	for (size_t i = 0; i < server->capacity_pollfds; i++) {
+		struct pollfd *p = &server->pollfds[i];
+		if (console_server_pollfd_reclaimable(p)) {
+			return (ssize_t)i;
+		}
+	}
+	return -1;
+}
+
+// returns the index of that pollfd in server->pollfds
+// we cannot return a pointer because 'realloc' may move server->pollfds
+ssize_t console_server_request_pollfd(struct console_server *server, int fd,
+				      short int events)
+{
+	ssize_t index;
+	struct pollfd *pollfd;
+
+	index = console_server_find_released_pollfd(server);
+
+	if (index < 0) {
+		const size_t newcap = server->capacity_pollfds + 1;
+
+		struct pollfd *newarr = reallocarray(server->pollfds, newcap,
+						     sizeof(struct pollfd));
+		if (newarr == NULL) {
+			return -1;
+		}
+		server->pollfds = newarr;
+
+		index = (ssize_t)server->capacity_pollfds;
+
+		server->capacity_pollfds = newcap;
+	}
+
+	pollfd = &server->pollfds[index];
+	pollfd->fd = fd;
+	pollfd->events = events;
+	pollfd->revents = 0;
+
+	return index;
+}
+
+int console_server_release_pollfd(struct console_server *server,
+				  size_t pollfd_index)
+{
+	if (pollfd_index >= server->capacity_pollfds) {
+		return -1;
+	}
+
+	struct pollfd *pfd = &server->pollfds[pollfd_index];
+
+	// mark pollfd as reclaimable
+
+	// ignore this file descriptor when calling 'poll'
+	// https://www.man7.org/linux/man-pages/man2/poll.2.html
+	pfd->fd = -1;
+	pfd->events = 0;
+	pfd->revents = ~0;
+
+	return 0;
+}
+
+/* populates server->tty.dev and server->tty.sysfs_devnode, using the tty kernel name */
+static int tty_find_device(struct console_server *server)
 {
 	char *tty_class_device_link = NULL;
 	char *tty_path_input_real = NULL;
@@ -73,23 +146,23 @@ static int tty_find_device(struct console *console)
 	char *tty_path_input = NULL;
 	int rc;
 
-	console->tty.type = TTY_DEVICE_UNDEFINED;
+	server->tty.type = TTY_DEVICE_UNDEFINED;
 
-	assert(console->tty.kname);
-	if (!strlen(console->tty.kname)) {
+	assert(server->tty.kname);
+	if (!strlen(server->tty.kname)) {
 		warnx("TTY kname must not be empty");
 		rc = -1;
 		goto out_free;
 	}
 
-	if (console->tty.kname[0] == '/') {
-		tty_path_input = strdup(console->tty.kname);
+	if (server->tty.kname[0] == '/') {
+		tty_path_input = strdup(server->tty.kname);
 		if (!tty_path_input) {
 			rc = -1;
 			goto out_free;
 		}
 	} else {
-		rc = asprintf(&tty_path_input, "/dev/%s", console->tty.kname);
+		rc = asprintf(&tty_path_input, "/dev/%s", server->tty.kname);
 		if (rc < 0) {
 			goto out_free;
 		}
@@ -109,15 +182,15 @@ static int tty_find_device(struct console *console)
 	 * https://amboar.github.io/notes/2023/05/02/testing-obmc-console-with-socat.html
 	 */
 	if (!strncmp(DEV_PTS_PATH, tty_path_input_real, strlen(DEV_PTS_PATH))) {
-		console->tty.type = TTY_DEVICE_PTY;
-		console->tty.dev = strdup(console->tty.kname);
-		rc = console->tty.dev ? 0 : -1;
+		server->tty.type = TTY_DEVICE_PTY;
+		server->tty.dev = strdup(server->tty.kname);
+		rc = server->tty.dev ? 0 : -1;
 		goto out_free;
 	}
 
 	tty_kname_real = basename(tty_path_input_real);
 	if (!tty_kname_real) {
-		warn("Can't find real name for %s", console->tty.kname);
+		warn("Can't find real name for %s", server->tty.kname);
 		rc = -1;
 		goto out_free;
 	}
@@ -145,13 +218,13 @@ static int tty_find_device(struct console *console)
 		warn("Can't find parent device for %s", tty_kname_real);
 	}
 
-	rc = asprintf(&console->tty.dev, "/dev/%s", tty_kname_real);
+	rc = asprintf(&server->tty.dev, "/dev/%s", tty_kname_real);
 	if (rc < 0) {
 		goto out_free;
 	}
 
 	// Default to non-VUART
-	console->tty.type = TTY_DEVICE_UART;
+	server->tty.type = TTY_DEVICE_UART;
 
 	/* Arbitrarily pick an attribute to differentiate UART vs VUART */
 	if (tty_sysfs_devnode) {
@@ -163,8 +236,8 @@ static int tty_find_device(struct console *console)
 
 		rc = access(tty_vuart_lpc_addr, F_OK);
 		if (!rc) {
-			console->tty.type = TTY_DEVICE_VUART;
-			console->tty.vuart.sysfs_devnode =
+			server->tty.type = TTY_DEVICE_VUART;
+			server->tty.vuart.sysfs_devnode =
 				strdup(tty_sysfs_devnode);
 		}
 	}
@@ -174,6 +247,7 @@ static int tty_find_device(struct console *console)
 out_free:
 	free(tty_vuart_lpc_addr);
 	free(tty_class_device_link);
+	free(tty_sysfs_devnode);
 	free(tty_device_tty_dir);
 	free(tty_device_reldir);
 	free(tty_path_input);
@@ -181,20 +255,20 @@ out_free:
 	return rc;
 }
 
-static int tty_set_sysfs_attr(struct console *console, const char *name,
+static int tty_set_sysfs_attr(struct console_server *server, const char *name,
 			      int value)
 {
 	char *path;
 	FILE *fp;
 	int rc;
 
-	assert(console->tty.type == TTY_DEVICE_VUART);
+	assert(server->tty.type == TTY_DEVICE_VUART);
 
-	if (!console->tty.vuart.sysfs_devnode) {
+	if (!server->tty.vuart.sysfs_devnode) {
 		return -1;
 	}
 
-	rc = asprintf(&path, "%s/%s", console->tty.vuart.sysfs_devnode, name);
+	rc = asprintf(&path, "%s/%s", server->tty.vuart.sysfs_devnode, name);
 	if (rc < 0) {
 		return -1;
 	}
@@ -202,7 +276,7 @@ static int tty_set_sysfs_attr(struct console *console, const char *name,
 	fp = fopen(path, "w");
 	if (!fp) {
 		warn("Can't access attribute %s on device %s", name,
-		     console->tty.kname);
+		     server->tty.kname);
 		rc = -1;
 		goto out_free;
 	}
@@ -211,7 +285,7 @@ static int tty_set_sysfs_attr(struct console *console, const char *name,
 	rc = fprintf(fp, "0x%x", value);
 	if (rc < 0) {
 		warn("Error writing to %s attribute of device %s", name,
-		     console->tty.kname);
+		     server->tty.kname);
 	}
 	fclose(fp);
 
@@ -223,20 +297,20 @@ out_free:
 /**
  * Set termios attributes on the console tty.
  */
-void tty_init_termios(struct console *console)
+void tty_init_termios(struct console_server *server)
 {
 	struct termios termios;
 	int rc;
 
-	rc = tcgetattr(console->tty.fd, &termios);
+	rc = tcgetattr(server->tty.fd, &termios);
 	if (rc) {
 		warn("Can't read tty termios");
 		return;
 	}
 
-	if (console->tty.type == TTY_DEVICE_UART && console->tty.uart.baud) {
-		if (cfsetspeed(&termios, console->tty.uart.baud) < 0) {
-			warn("Couldn't set speeds for %s", console->tty.kname);
+	if (server->tty.type == TTY_DEVICE_UART && server->tty.uart.baud) {
+		if (cfsetspeed(&termios, server->tty.uart.baud) < 0) {
+			warn("Couldn't set speeds for %s", server->tty.kname);
 		}
 	}
 
@@ -245,57 +319,63 @@ void tty_init_termios(struct console *console)
 	 */
 	cfmakeraw(&termios);
 
-	rc = tcsetattr(console->tty.fd, TCSANOW, &termios);
+	rc = tcsetattr(server->tty.fd, TCSANOW, &termios);
 	if (rc) {
-		warn("Can't set terminal options for %s", console->tty.kname);
+		warn("Can't set terminal options for %s", server->tty.kname);
 	}
 }
 
 /**
  * Open and initialise the serial device
  */
-static void tty_init_vuart_io(struct console *console)
+static void tty_init_vuart_io(struct console_server *server)
 {
-	assert(console->tty.type == TTY_DEVICE_VUART);
+	assert(server->tty.type == TTY_DEVICE_VUART);
 
-	if (console->tty.vuart.sirq) {
-		tty_set_sysfs_attr(console, "sirq", console->tty.vuart.sirq);
+	if (server->tty.vuart.sirq) {
+		tty_set_sysfs_attr(server, "sirq", server->tty.vuart.sirq);
 	}
 
-	if (console->tty.vuart.lpc_addr) {
-		tty_set_sysfs_attr(console, "lpc_address",
-				   console->tty.vuart.lpc_addr);
+	if (server->tty.vuart.lpc_addr) {
+		tty_set_sysfs_attr(server, "lpc_address",
+				   server->tty.vuart.lpc_addr);
 	}
 }
 
-static int tty_init_io(struct console *console)
+static int tty_init_io(struct console_server *server)
 {
-	console->tty.fd = open(console->tty.dev, O_RDWR);
-	if (console->tty.fd <= 0) {
-		warn("Can't open tty %s", console->tty.dev);
+	server->tty.fd = open(server->tty.dev, O_RDWR);
+	if (server->tty.fd <= 0) {
+		warn("Can't open tty %s", server->tty.dev);
 		return -1;
 	}
 
 	/* Disable character delay. We may want to later enable this when
 	 * we detect larger amounts of data
 	 */
-	fcntl(console->tty.fd, F_SETFL, FNDELAY);
+	fcntl(server->tty.fd, F_SETFL, FNDELAY);
 
-	tty_init_termios(console);
+	tty_init_termios(server);
 
-	console->pollfds[console->n_pollers].fd = console->tty.fd;
-	console->pollfds[console->n_pollers].events = POLLIN;
+	ssize_t index =
+		console_server_request_pollfd(server, server->tty.fd, POLLIN);
+
+	if (index < 0) {
+		return -1;
+	}
+
+	server->tty_pollfd_index = (size_t)index;
 
 	return 0;
 }
 
-static int tty_init_vuart(struct console *console, struct config *config)
+static int tty_init_vuart(struct console_server *server, struct config *config)
 {
 	unsigned long parsed;
 	const char *val;
 	char *endp;
 
-	assert(console->tty.type == TTY_DEVICE_VUART);
+	assert(server->tty.type == TTY_DEVICE_VUART);
 
 	val = config_get_value(config, "lpc-address");
 	if (val) {
@@ -312,7 +392,7 @@ static int tty_init_vuart(struct console *console, struct config *config)
 			return -1;
 		}
 
-		console->tty.vuart.lpc_addr = (uint16_t)parsed;
+		server->tty.vuart.lpc_addr = (uint16_t)parsed;
 		if (endp == optarg) {
 			warn("Invalid LPC address: '%s'", val);
 			return -1;
@@ -332,7 +412,7 @@ static int tty_init_vuart(struct console *console, struct config *config)
 			warn("Invalid LPC SERIRQ: '%s'", val);
 		}
 
-		console->tty.vuart.sirq = (int)parsed;
+		server->tty.vuart.sirq = (int)parsed;
 		if (endp == optarg) {
 			warn("Invalid sirq: '%s'", val);
 		}
@@ -341,39 +421,39 @@ static int tty_init_vuart(struct console *console, struct config *config)
 	return 0;
 }
 
-static int tty_init(struct console *console, struct config *config,
+static int tty_init(struct console_server *server, struct config *config,
 		    const char *tty_arg)
 {
 	const char *val;
 	int rc;
 
 	if (tty_arg) {
-		console->tty.kname = tty_arg;
+		server->tty.kname = tty_arg;
 	} else if ((val = config_get_value(config, "upstream-tty"))) {
-		console->tty.kname = val;
+		server->tty.kname = val;
 	} else {
 		warnx("Error: No TTY device specified");
 		return -1;
 	}
 
-	rc = tty_find_device(console);
+	rc = tty_find_device(server);
 	if (rc) {
 		return rc;
 	}
 
-	switch (console->tty.type) {
+	switch (server->tty.type) {
 	case TTY_DEVICE_VUART:
-		rc = tty_init_vuart(console, config);
+		rc = tty_init_vuart(server, config);
 		if (rc) {
 			return rc;
 		}
 
-		tty_init_vuart_io(console);
+		tty_init_vuart_io(server);
 		break;
 	case TTY_DEVICE_UART:
 		val = config_get_value(config, "baud");
 		if (val) {
-			if (config_parse_baud(&console->tty.uart.baud, val)) {
+			if (config_parse_baud(&server->tty.uart.baud, val)) {
 				warnx("Invalid baud rate: '%s'", val);
 			}
 		}
@@ -386,15 +466,21 @@ static int tty_init(struct console *console, struct config *config,
 		return -1;
 	}
 
-	return tty_init_io(console);
+	return tty_init_io(server);
 }
 
-static void tty_fini(struct console *console)
+static void tty_fini(struct console_server *server)
 {
-	if (console->tty.type == TTY_DEVICE_VUART) {
-		free(console->tty.vuart.sysfs_devnode);
+	if (server->tty_pollfd_index < server->capacity_pollfds) {
+		console_server_release_pollfd(server, server->tty_pollfd_index);
+		server->tty_pollfd_index = SIZE_MAX;
 	}
-	free(console->tty.dev);
+
+	if (server->tty.type == TTY_DEVICE_VUART) {
+		free(server->tty.vuart.sysfs_devnode);
+	}
+
+	free(server->tty.dev);
 }
 
 static int write_to_path(const char *path, const char *data)
@@ -505,7 +591,7 @@ out_free_glob:
 
 int console_data_out(struct console *console, const uint8_t *data, size_t len)
 {
-	return write_buf_to_fd(console->tty.fd, data, len);
+	return write_buf_to_fd(console->server->tty.fd, data, len);
 }
 
 /* Prepare a socket name */
@@ -533,32 +619,46 @@ static int set_socket_info(struct console *console, struct config *config,
 static void handlers_init(struct console *console, struct config *config)
 {
 	/* NOLINTBEGIN(bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp) */
-	extern struct handler *__start_handlers;
-	extern struct handler *__stop_handlers;
+	extern const struct handler_type *const __start_handlers[];
+	extern const struct handler_type *const __stop_handlers[];
 	/* NOLINTEND(bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp) */
-	struct handler *handler;
-	int i;
-	int rc;
+	size_t n_types;
+	int j = 0;
+	size_t i;
 
-	console->n_handlers = &__stop_handlers - &__start_handlers;
-	console->handlers = &__start_handlers;
+	n_types = __stop_handlers - __start_handlers;
+	console->handlers = calloc(n_types, sizeof(struct handler *));
+	if (!console->handlers) {
+		err(EXIT_FAILURE, "malloc(handlers)");
+	}
 
-	printf("%ld handler%s\n", console->n_handlers,
-	       console->n_handlers == 1 ? "" : "s");
+	printf("%zu handler type%s\n", n_types, n_types == 1 ? "" : "s");
 
-	for (i = 0; i < console->n_handlers; i++) {
-		handler = console->handlers[i];
+	for (i = 0; i < n_types; i++) {
+		const struct handler_type *type = __start_handlers[i];
+		struct handler *handler;
 
-		rc = 0;
-		if (handler->init) {
-			rc = handler->init(handler, console, config);
+		/* Should be picked up at build time by
+		 * console_handler_register, but check anyway
+		 */
+		if (!type->init || !type->fini) {
+			errx(EXIT_FAILURE,
+			     "invalid handler type %s: no init() / fini()",
+			     type->name);
 		}
 
-		handler->active = rc == 0;
+		handler = type->init(type, console, config);
 
-		printf("  %s [%sactive]\n", handler->name,
-		       handler->active ? "" : "in");
+		printf("  console '%s': handler %s [%sactive]\n",
+		       console->console_id, type->name, handler ? "" : "in");
+
+		if (handler) {
+			handler->type = type;
+			console->handlers[j++] = handler;
+		}
 	}
+
+	console->n_handlers = j;
 }
 
 static void handlers_fini(struct console *console)
@@ -568,10 +668,12 @@ static void handlers_fini(struct console *console)
 
 	for (i = 0; i < console->n_handlers; i++) {
 		handler = console->handlers[i];
-		if (handler->fini && handler->active) {
-			handler->fini(handler);
-		}
+		handler->type->fini(handler);
 	}
+
+	free(console->handlers);
+	console->handlers = NULL;
+	console->n_handlers = 0;
 }
 
 static int get_current_time(struct timeval *tv)
@@ -611,12 +713,22 @@ struct poller *console_poller_register(struct console *console,
 	struct poller *poller;
 	long n;
 
+	const ssize_t index = console_server_request_pollfd(
+		console->server, fd, (short)(events & 0x7fff));
+	if (index < 0) {
+		fprintf(stderr, "Error requesting pollfd\n");
+		return NULL;
+	}
+
 	poller = malloc(sizeof(*poller));
+	// TODO: check for error case of malloc here and release previously requested pollfd
 	poller->remove = false;
 	poller->handler = handler;
 	poller->event_fn = poller_fn;
 	poller->timeout_fn = timeout_fn;
+	timerclear(&poller->timeout);
 	poller->data = data;
+	poller->pollfd_index = index;
 
 	/* add one to our pollers array */
 	n = console->n_pollers++;
@@ -627,21 +739,10 @@ struct poller *console_poller_register(struct console *console,
 	/* NOLINTBEGIN(bugprone-sizeof-expression) */
 	console->pollers = reallocarray(console->pollers, console->n_pollers,
 					sizeof(*console->pollers));
+	// TODO: check for the error case of reallocarray and release previously requested pollfd
 	/* NOLINTEND(bugprone-sizeof-expression) */
 
 	console->pollers[n] = poller;
-
-	/* increase pollfds array too  */
-	console->pollfds = reallocarray(
-		console->pollfds, (MAX_INTERNAL_POLLFD + console->n_pollers),
-		sizeof(*console->pollfds));
-
-	/* shift the end pollfds up by one */
-	memcpy(&console->pollfds[n + 1], &console->pollfds[n],
-	       sizeof(*console->pollfds) * MAX_INTERNAL_POLLFD);
-
-	console->pollfds[n].fd = fd;
-	console->pollfds[n].events = (short)(events & 0x7fff);
 
 	return poller;
 }
@@ -671,18 +772,17 @@ void console_poller_unregister(struct console *console, struct poller *poller)
 	memmove(&console->pollers[i], &console->pollers[i + 1],
 		sizeof(*console->pollers) * (console->n_pollers - i));
 
-	console->pollers = reallocarray(console->pollers, console->n_pollers,
-					sizeof(*console->pollers));
+	if (console->n_pollers == 0) {
+		free(console->pollers);
+		console->pollers = NULL;
+	} else {
+		console->pollers = reallocarray(console->pollers,
+						console->n_pollers,
+						sizeof(*console->pollers));
+	}
 	/* NOLINTEND(bugprone-sizeof-expression) */
 
-	/* ... and the pollfds array */
-	memmove(&console->pollfds[i], &console->pollfds[i + 1],
-		sizeof(*console->pollfds) *
-			(MAX_INTERNAL_POLLFD + console->n_pollers - i));
-
-	console->pollfds = reallocarray(
-		console->pollfds, (MAX_INTERNAL_POLLFD + console->n_pollers),
-		sizeof(*console->pollfds));
+	console_server_release_pollfd(console->server, poller->pollfd_index);
 
 	free(poller);
 }
@@ -690,16 +790,8 @@ void console_poller_unregister(struct console *console, struct poller *poller)
 void console_poller_set_events(struct console *console, struct poller *poller,
 			       int events)
 {
-	int i;
-
-	/* find the entry in our pollers array */
-	for (i = 0; i < console->n_pollers; i++) {
-		if (console->pollers[i] == poller) {
-			break;
-		}
-	}
-
-	console->pollfds[i].events = (short)(events & 0x7fff);
+	console->server->pollfds[poller->pollfd_index].events =
+		(short)(events & 0x7fff);
 }
 
 void console_poller_set_timeout(struct console *console __attribute__((unused)),
@@ -767,7 +859,12 @@ static int call_pollers(struct console *console, struct timeval *cur_time)
 	 */
 	for (i = 0; i < console->n_pollers; i++) {
 		poller = console->pollers[i];
-		pollfd = &console->pollfds[i];
+		pollfd = &console->server->pollfds[poller->pollfd_index];
+		if (pollfd->fd < 0) {
+			// pollfd has already been released
+			continue;
+		}
+
 		prc = POLLER_OK;
 
 		/* process pending events... */
@@ -824,101 +921,357 @@ static int call_pollers(struct console *console, struct timeval *cur_time)
 static void sighandler(int signal)
 {
 	if (signal == SIGINT) {
-		sigint = true;
+		sigint = 1;
 	}
 }
 
-int run_console(struct console *console)
+static int run_console_per_console(struct console *console, size_t buf_size,
+				   struct timeval *tv)
 {
-	sighandler_t sighandler_save = signal(SIGINT, sighandler);
+	int rc;
+
+	if (console->rb->size < buf_size) {
+		fprintf(stderr, "Ringbuffer size should be greater than %zuB\n",
+			buf_size);
+		return -1;
+	}
+
+	if (sigint) {
+		warnx("Received interrupt, exiting\n");
+		return -1;
+	}
+
+	/* ... and then the pollers */
+	rc = call_pollers(console, tv);
+	if (rc) {
+		return -1;
+	}
+
+	return 0;
+}
+
+static int run_console_iteration(struct console_server *server)
+{
 	struct timeval tv;
+	uint8_t buf[4096];
 	long timeout;
 	ssize_t rc;
 
-	rc = 0;
+	rc = get_current_time(&tv);
+	if (rc) {
+		warn("Failed to read current time");
+		return -1;
+	}
 
-	for (;;) {
-		uint8_t buf[4096];
+	timeout = get_poll_timeout(server->active, &tv);
 
-		if (console->rb->size < sizeof(buf)) {
-			fprintf(stderr,
-				"Ringbuffer size should be greater than %zuB\n",
-				sizeof(buf));
-			rc = -1;
-			break;
+	rc = poll(server->pollfds, server->capacity_pollfds, (int)timeout);
+
+	if (sigint) {
+		warnx("Received interrupt, exiting\n");
+		return -1;
+	}
+
+	if (rc < 0) {
+		if (errno == EINTR) {
+			return 0;
+		}
+		warn("poll error");
+		return -1;
+	}
+
+	/* process internal fd first */
+	if (server->pollfds[server->tty_pollfd_index].revents) {
+		rc = read(server->tty.fd, buf, sizeof(buf));
+		if (rc <= 0) {
+			warn("Error reading from tty device");
+			return -1;
 		}
 
-		if (sigint) {
-			fprintf(stderr, "Received interrupt, exiting\n");
-			break;
-		}
-
-		rc = get_current_time(&tv);
+		rc = ringbuffer_queue(server->active->rb, buf, rc);
 		if (rc) {
-			warn("Failed to read current time");
-			break;
+			return -1;
 		}
+	}
 
-		timeout = get_poll_timeout(console, &tv);
+	// process dbus
+	struct pollfd *dbus_pollfd =
+		&(server->pollfds[server->dbus_pollfd_index]);
+	if (dbus_pollfd->revents) {
+		sd_bus_process(server->bus, NULL);
+	}
 
-		rc = poll(console->pollfds,
-			  console->n_pollers + MAX_INTERNAL_POLLFD,
-			  (int)timeout);
+	for (size_t i = 0; i < server->n_consoles; i++) {
+		struct console *console = server->consoles[i];
 
-		if (rc < 0) {
-			if (errno == EINTR) {
-				continue;
-			}
-			warn("poll error");
-			break;
+		rc = run_console_per_console(console, sizeof(buf), &tv);
+		if (rc != 0) {
+			return -1;
 		}
+	}
 
-		/* process internal fd first */
-		if (console->pollfds[console->n_pollers].revents) {
-			rc = read(console->tty.fd, buf, sizeof(buf));
-			if (rc <= 0) {
-				warn("Error reading from tty device");
-				rc = -1;
-				break;
-			}
-			rc = ringbuffer_queue(console->rb, buf, rc);
-			if (rc) {
-				break;
-			}
-		}
+	return 0;
+}
 
-		if (console->pollfds[console->n_pollers + 1].revents) {
-			sd_bus_process(console->bus, NULL);
-		}
+int run_server(struct console_server *server)
+{
+	sighandler_t sighandler_save;
+	ssize_t rc = 0;
 
-		/* ... and then the pollers */
-		rc = call_pollers(console, &tv);
+	if (server->n_consoles == 0) {
+		warnx("no console configured for this server");
+		return -1;
+	}
+
+	sighandler_save = signal(SIGINT, sighandler);
+	for (;;) {
+		rc = run_console_iteration(server);
 		if (rc) {
 			break;
 		}
 	}
-
 	signal(SIGINT, sighandler_save);
-	sd_bus_unref(console->bus);
 
 	return rc ? -1 : 0;
 }
+
 static const struct option options[] = {
 	{ "config", required_argument, 0, 'c' },
 	{ "console-id", required_argument, 0, 'i' },
 	{ 0, 0, 0, 0 },
 };
 
-int main(int argc, char **argv)
+static struct console *console_init(struct console_server *server,
+				    struct config *config,
+				    const char *console_id)
 {
 	size_t buffer_size = default_buffer_size;
+	const char *buffer_size_str = NULL;
+	int rc;
+
+	struct console *console = calloc(1, sizeof(struct console));
+	if (console == NULL) {
+		return NULL;
+	}
+
+	console->server = server;
+	console->console_id = console_id;
+
+	buffer_size_str =
+		config_get_section_value(config, console_id, "ringbuffer-size");
+
+	if (!buffer_size_str) {
+		buffer_size_str = config_get_value(config, "ringbuffer-size");
+	}
+
+	if (buffer_size_str) {
+		rc = config_parse_bytesize(buffer_size_str, &buffer_size);
+		if (rc) {
+			warn("Invalid ringbuffer-size. Default to %zukB",
+			     buffer_size >> 10);
+		}
+	}
+
+	console->rb = ringbuffer_init(buffer_size);
+	if (!console->rb) {
+		goto cleanup_console;
+	}
+
+	rc = console_mux_init(console, config);
+	if (rc) {
+		warnx("could not set mux gpios from config, exiting");
+		goto cleanup_rb;
+	}
+
+	if (set_socket_info(console, config, console_id)) {
+		warnx("set_socket_info failed");
+		goto cleanup_rb;
+	}
+
+	rc = dbus_init(console, config);
+	if (rc != 0) {
+		goto cleanup_rb;
+	}
+
+	handlers_init(console, config);
+
+	return console;
+
+cleanup_rb:
+	free(console->rb);
+cleanup_console:
+	free(console);
+
+	return NULL;
+}
+
+static void console_fini(struct console *console)
+{
+	handlers_fini(console);
+	ringbuffer_fini(console->rb);
+	free(console->pollers);
+	free(console);
+}
+
+// 'opt_console_id' may be NULL
+static int console_server_add_console(struct console_server *server,
+				      struct config *config,
+				      const char *opt_console_id)
+{
+	const char *console_id;
+	struct console *console;
+
+	console_id = config_resolve_console_id(config, opt_console_id);
+
+	struct console **tmp = reallocarray(server->consoles,
+					    server->n_consoles + 1,
+					    sizeof(struct console *));
+	if (tmp == NULL) {
+		warnx("could not realloc server->consoles");
+		return -1;
+	}
+	server->consoles = tmp;
+
+	console = console_init(server, config, console_id);
+	if (console == NULL) {
+		warnx("console_init failed");
+		return -1;
+	}
+
+	server->consoles[server->n_consoles++] = console;
+
+	return 0;
+}
+
+// returns NULL on error
+static struct console *
+console_server_add_consoles(struct console_server *server,
+			    const char *arg_console_id)
+{
+	int rc;
+
+	const int nsections = config_count_sections(server->config);
+	if (nsections < 0) {
+		return NULL;
+	}
+
+	if (nsections == 0) {
+		const char *console_id = arg_console_id;
+
+		rc = console_server_add_console(server, server->config,
+						console_id);
+		if (rc != 0) {
+			return NULL;
+		}
+	}
+
+	for (int i = 0; i < nsections; i++) {
+		const char *console_id =
+			config_get_section_name(server->config, i);
+
+		if (console_id == NULL) {
+			warnx("no console id provided\n");
+			return NULL;
+		}
+
+		rc = console_server_add_console(server, server->config,
+						console_id);
+		if (rc != 0) {
+			return NULL;
+		}
+	}
+
+	const char *initially_active =
+		config_get_value(server->config, "active-console");
+	if (!initially_active) {
+		return server->consoles[0];
+	}
+
+	printf("setting console-id '%s' as the initially active console\n",
+	       initially_active);
+
+	for (size_t i = 0; i < server->n_consoles; i++) {
+		struct console *console = server->consoles[i];
+
+		if (strcmp(console->console_id, initially_active) == 0) {
+			return console;
+		}
+	}
+
+	warnx("'active-console' '%s' not found among console ids\n",
+	      initially_active);
+
+	return NULL;
+}
+
+int console_server_init(struct console_server *server,
+			const char *config_filename,
+			const char *config_tty_kname, const char *console_id)
+{
+	int rc;
+	memset(server, 0, sizeof(struct console_server));
+
+	server->tty_pollfd_index = -1;
+
+	server->config = config_init(config_filename);
+	if (server->config == NULL) {
+		return -1;
+	}
+
+	rc = console_server_mux_init(server);
+	if (rc != 0) {
+		return -1;
+	}
+
+	uart_routing_init(server->config);
+
+	rc = tty_init(server, server->config, config_tty_kname);
+	if (rc != 0) {
+		warnx("error during tty_init, exiting.\n");
+		return -1;
+	}
+
+	rc = dbus_server_init(server);
+	if (rc != 0) {
+		warnx("error during dbus init for console server");
+		return -1;
+	}
+
+	struct console *initial_active =
+		console_server_add_consoles(server, console_id);
+	if (initial_active == NULL) {
+		return -1;
+	}
+
+	rc = console_mux_activate(initial_active);
+	if (rc != 0) {
+		return -1;
+	}
+
+	return 0;
+}
+
+void console_server_fini(struct console_server *server)
+{
+	for (size_t i = 0; i < server->n_consoles; i++) {
+		console_fini(server->consoles[i]);
+	}
+
+	free(server->consoles);
+	dbus_server_fini(server);
+	tty_fini(server);
+	free(server->pollfds);
+	console_server_mux_fini(server);
+	config_fini(server->config);
+}
+
+int main(int argc, char **argv)
+{
 	const char *config_filename = NULL;
 	const char *config_tty_kname = NULL;
-	const char *buffer_size_str = NULL;
 	const char *console_id = NULL;
-	struct console *console;
-	struct config *config;
-	int rc;
+	struct console_server server = { 0 };
+	int rc = 0;
 
 	for (;;) {
 		int c;
@@ -945,52 +1298,18 @@ int main(int argc, char **argv)
 
 	if (optind < argc) {
 		config_tty_kname = argv[optind];
+	} else {
+		errx(EXIT_FAILURE, "no tty device path has been provided\n");
 	}
 
-	config = config_init(config_filename);
+	rc = console_server_init(&server, config_filename, config_tty_kname,
+				 console_id);
 
-	console = malloc(sizeof(struct console));
-	memset(console, 0, sizeof(*console));
-	console->pollfds =
-		calloc(MAX_INTERNAL_POLLFD, sizeof(*console->pollfds));
-	buffer_size_str = config_get_value(config, "ringbuffer-size");
-	if (buffer_size_str) {
-		rc = config_parse_bytesize(buffer_size_str, &buffer_size);
-		if (rc) {
-			warn("Invalid ringbuffer-size. Default to %zukB",
-			     buffer_size >> 10);
-		}
-	}
-	console->rb = ringbuffer_init(buffer_size);
-
-	if (set_socket_info(console, config, console_id)) {
-		rc = -1;
-		goto out_config_fini;
+	if (rc == 0) {
+		rc = run_server(&server);
 	}
 
-	uart_routing_init(config);
-
-	rc = tty_init(console, config, config_tty_kname);
-	if (rc) {
-		goto out_config_fini;
-	}
-
-	dbus_init(console, config);
-
-	handlers_init(console, config);
-
-	rc = run_console(console);
-
-	handlers_fini(console);
-
-	tty_fini(console);
-
-out_config_fini:
-	config_fini(config);
-
-	free(console->pollers);
-	free(console->pollfds);
-	free(console);
+	console_server_fini(&server);
 
 	return rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

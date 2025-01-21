@@ -21,6 +21,21 @@ Change categories:
 
 1. config: Added support for the `aspeed-uart-routing` configuration key
 2. config: Added support for the `ringbuffer-size` configuration key
+3. UART multiplexer support
+
+   More details can be found [in the documentation](docs/mux-support.md).
+
+4. Integration tests
+
+   Note that it's now advised to run `meson test ...` under [dbus-run-session][]
+   as the integration tests connect to the session bus.
+
+[dbus-run-session]:
+  https://manpages.debian.org/bookworm/dbus-daemon/dbus-run-session.1.en.html
+
+### Changed:
+
+1. The bespoke config parser was replaced with iniparser
 
 ### Removed
 
@@ -65,3 +80,7 @@ Change categories:
 ### Fixed
 
 1. obmc-console: Consolidate handling of default socket-id
+
+### Fixed
+
+1. log-handler: Set the end of the file as the file size
