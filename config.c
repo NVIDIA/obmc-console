@@ -29,169 +29,115 @@
 
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include "console-server.h"
+
+#include <iniparser/iniparser.h>
+
+#include "config-internal.h"
+#include "config.h"
+#include "util.h"
 
 static const char *config_default_filename = SYSCONFDIR "/obmc-console.conf";
 
-struct config_item {
-	char *name;
-	char *value;
-	struct config_item *next;
-};
-
-struct config {
-	struct config_item *items;
-};
-
 const char *config_get_value(struct config *config, const char *name)
 {
-	struct config_item *item;
+	char buf[CONFIG_MAX_KEY_LENGTH];
+	int rc;
 
-	if (!config) {
+	if (!config->dict) {
 		return NULL;
 	}
 
-	for (item = config->items; item; item = item->next) {
-		if (!strcasecmp(item->name, name)) {
-			return item->value;
-		}
+	rc = snprintf(buf, CONFIG_MAX_KEY_LENGTH, ":%s", name);
+	if (rc < 0) {
+		return NULL;
 	}
 
-	return NULL;
-}
-
-static void config_parse(struct config *config, char *buf)
-{
-	struct config_item *item;
-	char *name;
-	char *value;
-	char *p;
-	char *line;
-
-	for (p = NULL, line = strtok_r(buf, "\n", &p); line;
-	     line = strtok_r(NULL, "\n", &p)) {
-		char *end;
-		int rc;
-
-		/* trim leading space */
-		while (isspace(*line)) {
-			line++;
-		}
-
-		/* skip comments */
-		if (*line == '#') {
-			continue;
-		}
-
-		name = malloc(strlen(line));
-		value = malloc(strlen(line));
-		if (name && value) {
-			rc = sscanf(line, "%[^ =] = %[^#]s", name, value);
-		} else {
-			rc = -ENOMEM;
-		}
-
-		if (rc != 2) {
-			free(name);
-			free(value);
-			continue;
-		}
-
-		/* trim trailing space */
-		end = value + strlen(value) - 1;
-		while (isspace(*end)) {
-			*end-- = '\0';
-		}
-
-		/* create a new item and add to our list */
-		item = malloc(sizeof(*item));
-		item->name = name;
-		item->value = value;
-		item->next = config->items;
-		config->items = item;
+	if ((size_t)rc >= sizeof(buf)) {
+		return NULL;
 	}
-}
 
-static struct config *config_init_fd(int fd, const char *filename)
-{
-	struct config *config;
-	size_t size;
-	size_t len;
-	ssize_t rc;
-	char *buf;
-
-	size = 4096;
-	len = 0;
-	buf = malloc(size + 1);
-	config = NULL;
-
-	for (;;) {
-		rc = read(fd, buf + len, size - len);
-		if (rc < 0) {
-			warn("Can't read from configuration file %s", filename);
-			goto out_free;
-
-		} else if (!rc) {
-			break;
-		}
-		len += rc;
-		if (len == size) {
-			if (size > SIZE_MAX >> 1) {
-				warn("File %s is too large to read.", filename);
-				goto out_free;
-			}
-			size <<= 1;
-			buf = realloc(buf, size + 1);
-		}
+	const char *value = iniparser_getstring(config->dict, buf, NULL);
+	if (value && strlen(value) == 0) {
+		return NULL;
 	}
-	buf[len] = '\0';
 
-	config = malloc(sizeof(*config));
-	config->items = NULL;
-
-	config_parse(config, buf);
-
-out_free:
-	free(buf);
-	return config;
+	return value;
 }
 
 struct config *config_init(const char *filename)
 {
 	struct config *config;
-	int fd;
+	dictionary *dict;
 
 	if (!filename) {
 		filename = config_default_filename;
 	}
 
-	fd = open(filename, O_RDONLY);
-	if (fd < 0) {
-		warn("Can't open configuration file %s", filename);
+	if (access(filename, R_OK) == 0) {
+		dict = iniparser_load(filename);
+		if (!dict) {
+			/* Assume this is a parse failure */
+			return NULL;
+		}
+	} else {
+		/* If a config file was explicitly specified, then lack of access is always an error */
+		if (filename != config_default_filename) {
+			warn("Failed to open configuration file at '%s'",
+			     filename);
+			return NULL;
+		}
+
+		/* For the default config path, any result other than not-present is an error */
+		if (errno != ENOENT && errno != ENOTDIR) {
+			warn("Failed to open configuration file at '%s'",
+			     filename);
+			return NULL;
+		}
+
+		/* Config not present at default path, pretend its empty */
+		dict = NULL;
+	}
+
+	config = malloc(sizeof(*config));
+	if (!config) {
+		iniparser_freedict(dict);
 		return NULL;
 	}
 
-	config = config_init_fd(fd, filename);
-
-	close(fd);
+	config->dict = dict;
 
 	return config;
 }
 
+const char *config_get_section_value(struct config *config, const char *secname,
+				     const char *name)
+{
+	char buf[CONFIG_MAX_KEY_LENGTH];
+	int rc;
+
+	rc = snprintf(buf, sizeof(buf), "%s:%s", secname, name);
+	if (rc < 0) {
+		return NULL;
+	}
+
+	if ((size_t)rc >= sizeof(buf)) {
+		// error / key too long for the buffer
+		warnx("config: section:key too long for buffer: '%s':'%s'",
+		      secname, name);
+		return NULL;
+	}
+
+	return iniparser_getstring(config->dict, buf, NULL);
+}
+
 void config_fini(struct config *config)
 {
-	struct config_item *item;
-	struct config_item *next;
-
 	if (!config) {
 		return;
 	}
 
-	for (item = config->items; item; item = next) {
-		next = item->next;
-		free(item->name);
-		free(item->value);
-		free(item);
+	if (config->dict) {
+		iniparser_freedict(config->dict);
 	}
 
 	free(config);
@@ -203,10 +149,7 @@ struct terminal_speed_name {
 	const char *name;
 };
 
-#define TERM_SPEED(x)                                                          \
-	{                                                                      \
-		B##x, x, #x                                                    \
-	}
+#define TERM_SPEED(x) { B##x, x, #x }
 
 // clang-format off
 static const struct terminal_speed_name terminal_speeds[] = {
@@ -362,21 +305,12 @@ const char *config_resolve_console_id(struct config *config, const char *id_arg)
 	return DEFAULT_CONSOLE_ID;
 }
 
-#ifdef CONFIG_TEST
-int main(void)
+int config_count_sections(struct config *config)
 {
-	struct config_item *item;
-	struct config *config;
-
-	config = config_init_fd(STDIN_FILENO, "<stdin>");
-	if (!config)
-		return EXIT_FAILURE;
-
-	for (item = config->items; item; item = item->next)
-		printf("%s: %s\n", item->name, item->value);
-
-	config_fini(config);
-
-	return EXIT_SUCCESS;
+	return iniparser_getnsec(config->dict);
 }
-#endif
+
+const char *config_get_section_name(struct config *config, int i)
+{
+	return iniparser_getsecname(config->dict, i);
+}

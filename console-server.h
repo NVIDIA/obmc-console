@@ -44,23 +44,36 @@ struct config;
  * If a handler needs to monitor a separate file descriptor for events, use the
  * poller API, through console_poller_register().
  */
-struct handler {
+struct handler;
+
+struct handler_type {
 	const char *name;
-	int (*init)(struct handler *handler, struct console *console,
-		    struct config *config);
+	struct handler *(*init)(const struct handler_type *type,
+				struct console *console, struct config *config);
 	void (*fini)(struct handler *handler);
 	int (*baudrate)(struct handler *handler, speed_t baudrate);
-	bool active;
+	void (*deselect)(struct handler *handler);
+};
+
+struct handler {
+	const struct handler_type *type;
 };
 
 /* NOLINTBEGIN(bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp) */
 #define __handler_name(n) __handler_##n
 #define _handler_name(n)  __handler_name(n)
 
+#ifndef __clang__
+#define handler_type_check(h) BUILD_ASSERT_OR_ZERO((h)->init && (h)->fini)
+#else
+/* clang doesn't seem to be able to constify the type ops */
+#define handler_type_check(h) 0
+#endif
+
 #define console_handler_register(h)                                            \
 	static const __attribute__((section("handlers")))                      \
-	__attribute__((used)) struct handler *                                 \
-	_handler_name(__COUNTER__) = h
+	__attribute__((used)) struct handler_type *                            \
+	_handler_name(__COUNTER__) = (h) + handler_type_check(h)
 /* NOLINTEND(bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp) */
 
 int console_data_out(struct console *console, const uint8_t *data, size_t len);
@@ -85,15 +98,7 @@ enum tty_device {
 	TTY_DEVICE_PTY,
 };
 
-enum escape_state {
-	escape_idle = 0,
-	escape_cr,
-	escape_lf,
-	escape_leader,
-};
-
-/* Console server structure */
-struct console {
+struct console_server {
 	struct {
 		const char *kname;
 		char *dev;
@@ -110,6 +115,38 @@ struct console {
 			} uart;
 		};
 	} tty;
+
+	// All the pollfds are stored here,
+	// so 'poll' can operate on them.
+	// The other 'pollfd*' are just pointers to this array.
+	struct pollfd *pollfds;
+	size_t capacity_pollfds;
+
+	// index into pollfds
+	size_t tty_pollfd_index;
+
+	struct config *config;
+
+	// the currently active console
+	struct console *active;
+
+	struct console **consoles;
+	size_t n_consoles;
+
+	// index into (struct console_server)->pollfds
+	size_t dbus_pollfd_index;
+
+	struct sd_bus *bus;
+
+	// may be NULL in case there is no mux
+	struct console_mux *mux;
+};
+
+struct console {
+	// point back to the console server
+	// which we are a member of
+	struct console_server *server;
+
 	const char *console_id;
 
 	/* Socket name starts with null character hence we need length */
@@ -124,10 +161,8 @@ struct console {
 	struct poller **pollers;
 	long n_pollers;
 
-	struct pollfd *pollfds;
-	struct sd_bus *bus;
-
-	enum escape_state state;
+	// values to configure the mux
+	unsigned long mux_index;
 };
 
 /* poller API */
@@ -138,13 +173,9 @@ struct poller {
 	poller_timeout_fn_t timeout_fn;
 	struct timeval timeout;
 	bool remove;
-};
 
-/* we have two extra entry in the pollfds array for the VUART tty */
-enum internal_pollfds {
-	POLLFD_HOSTTTY = 0,
-	POLLFD_DBUS = 1,
-	MAX_INTERNAL_POLLFD = 2,
+	// index into (struct console_server)->pollfds
+	size_t pollfd_index;
 };
 
 struct poller *console_poller_register(struct console *console,
@@ -212,20 +243,7 @@ console_ringbuffer_consumer_register(struct console *console,
 				     ringbuffer_poll_fn_t poll_fn, void *data);
 
 /* Console server API */
-void tty_init_termios(struct console *console);
-
-/* config API */
-struct config;
-const char *config_get_value(struct config *config, const char *name);
-struct config *config_init(const char *filename);
-const char *config_resolve_console_id(struct config *config,
-				      const char *id_arg);
-void config_fini(struct config *config);
-
-int config_parse_baud(speed_t *speed, const char *baud_string);
-uint32_t parse_baud_to_int(speed_t speed);
-speed_t parse_int_to_baud(uint32_t baud);
-int config_parse_bytesize(const char *size_str, size_t *size);
+void tty_init_termios(struct console_server *server);
 
 /* socket paths */
 ssize_t console_socket_path(socket_path_t path, const char *id);
@@ -235,23 +253,35 @@ ssize_t console_socket_path_readable(const struct sockaddr_un *addr,
 /* utils */
 int write_buf_to_fd(int fd, const uint8_t *buf, size_t len);
 
+/* console_server dbus */
+int dbus_server_init(struct console_server *server);
+void dbus_server_fini(struct console_server *server);
+
 /* console-dbus API */
-void dbus_init(struct console *console,
-	       struct config *config __attribute__((unused)));
+int dbus_init(struct console *console,
+	      struct config *config __attribute__((unused)));
 
 /* socket-handler API */
 int dbus_create_socket_consumer(struct console *console);
-
-#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
 #ifndef offsetof
 #define offsetof(type, member) ((unsigned long)&((type *)NULL)->member)
 #endif
 
 #define container_of(ptr, type, member)                                        \
-	((type *)((void *)((ptr)-offsetof(type, member))))
+	((type *)((void *)((ptr) - offsetof(type, member))))
 
 #define BUILD_ASSERT(c)                                                        \
 	do {                                                                   \
 		char __c[(c) ? 1 : -1] __attribute__((unused));                \
 	} while (0)
+
+#define BUILD_ASSERT_OR_ZERO(c) (sizeof(char[(c) ? 1 : -1]) - 1)
+
+// returns the index of that pollfd in server->pollfds
+// we cannot return a pointer because 'realloc' may move server->pollfds
+ssize_t console_server_request_pollfd(struct console_server *server, int fd,
+				      short int events);
+
+int console_server_release_pollfd(struct console_server *server,
+				  size_t pollfd_index);

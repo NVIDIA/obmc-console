@@ -52,11 +52,14 @@ if udev.found()
                install_dir: udev.get_variable('udevdir') / 'rules.d')
 endif
 
-executable('obmc-console-server',
+iniparser_dep = dependency('iniparser')
+
+server = executable('obmc-console-server',
            'config.c',
            'console-dbus.c',
            'console-server.c',
            'console-socket.c',
+           'console-mux.c',
            'log-handler.c',
            'ringbuffer.c',
            'socket-handler.c',
@@ -68,12 +71,14 @@ executable('obmc-console-server',
            ],
            dependencies: [
              dependency('libsystemd'),
+             iniparser_dep,
+             dependency('libgpiod'),
              meson.get_compiler('c').find_library('rt')
            ],
            install_dir: get_option('sbindir'),
            install: true)
 
-executable('obmc-console-client',
+client = executable('obmc-console-client',
            'config.c',
            'console-client.c',
            'console-socket.c',
@@ -81,6 +86,11 @@ executable('obmc-console-client',
            c_args: [
              '-DSYSCONFDIR="@0@"'.format(get_option('sysconfdir'))
            ],
+           dependencies: [
+             iniparser_dep,
+           ],
            install: true)
 
-subdir('test')
+if get_option('tests')
+  subdir('test')
+endif

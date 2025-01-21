@@ -20,6 +20,8 @@
 #include <string.h>
 #include <sys/socket.h>
 
+#include "config.h"
+#include "console-mux.h"
 #include "console-server.h"
 
 /* size of the dbus object path length */
@@ -33,22 +35,25 @@ const size_t dbus_obj_path_len = 1024;
 
 static void tty_change_baudrate(struct console *console)
 {
-	struct handler *handler;
 	int i;
 	int rc;
 
-	tty_init_termios(console);
+	tty_init_termios(console->server);
 
 	for (i = 0; i < console->n_handlers; i++) {
+		const struct handler_type *type;
+		struct handler *handler;
+
 		handler = console->handlers[i];
-		if (!handler->baudrate) {
+		type = handler->type;
+		if (!type->baudrate) {
 			continue;
 		}
 
-		rc = handler->baudrate(handler, console->tty.uart.baud);
+		rc = type->baudrate(handler, console->server->tty.uart.baud);
 		if (rc) {
 			warnx("Can't set terminal baudrate for handler %s",
-			      handler->name);
+			      type->name);
 		}
 	}
 }
@@ -78,8 +83,8 @@ static int set_baud_handler(sd_bus *bus, const char *path,
 		return -EINVAL;
 	}
 
-	assert(console->tty.type == TTY_DEVICE_UART);
-	console->tty.uart.baud = speed;
+	assert(console->server->tty.type == TTY_DEVICE_UART);
+	console->server->tty.uart.baud = speed;
 	tty_change_baudrate(console);
 
 	sd_bus_emit_properties_changed(bus, path, interface, property, NULL);
@@ -95,13 +100,14 @@ static int get_baud_handler(sd_bus *bus __attribute__((unused)),
 			    sd_bus_error *error __attribute__((unused)))
 {
 	struct console *console = userdata;
+	struct console_server *server = console->server;
 	uint64_t baudrate;
 	int r;
 
-	assert(console->tty.type == TTY_DEVICE_UART);
-	baudrate = parse_baud_to_int(console->tty.uart.baud);
+	assert(server->tty.type == TTY_DEVICE_UART);
+	baudrate = parse_baud_to_int(server->tty.uart.baud);
 	if (!baudrate) {
-		warnx("Invalid baud rate: '%d'", console->tty.uart.baud);
+		warnx("Invalid baud rate: '%d'", server->tty.uart.baud);
 	}
 
 	r = sd_bus_message_append(reply, "t", baudrate);
@@ -121,6 +127,8 @@ static int method_connect(sd_bus_message *msg, void *userdata,
 		sd_bus_error_set_const(err, DBUS_ERR, "Internal error");
 		return sd_bus_reply_method_error(msg, err);
 	}
+
+	console_mux_activate(console);
 
 	/* Register the consumer. */
 	socket_fd = dbus_create_socket_consumer(console);
@@ -156,25 +164,56 @@ static const sd_bus_vtable console_access_vtable[] = {
 	SD_BUS_VTABLE_END,
 };
 
-void dbus_init(struct console *console,
-	       struct config *config __attribute__((unused)))
+int dbus_server_init(struct console_server *server)
+{
+	int r;
+	int fd;
+	r = sd_bus_default(&server->bus);
+	if (r < 0) {
+		warnx("Failed to connect to bus: %s", strerror(-r));
+		return -1;
+	}
+
+	fd = sd_bus_get_fd(server->bus);
+	if (fd < 0) {
+		warnx("Couldn't get the bus file descriptor");
+		sd_bus_unref(server->bus);
+		return -1;
+	}
+
+	const ssize_t index = console_server_request_pollfd(server, fd, POLLIN);
+	if (index < 0) {
+		warnx("Error: failed to allocate pollfd");
+		sd_bus_unref(server->bus);
+		return -1;
+	}
+
+	server->dbus_pollfd_index = index;
+	return 0;
+}
+
+void dbus_server_fini(struct console_server *server)
+{
+	if (server->dbus_pollfd_index < server->capacity_pollfds) {
+		console_server_release_pollfd(server,
+					      server->dbus_pollfd_index);
+		server->dbus_pollfd_index = SIZE_MAX;
+	}
+
+	sd_bus_unref(server->bus);
+}
+
+int dbus_init(struct console *console,
+	      struct config *config __attribute__((unused)))
 {
 	char obj_name[dbus_obj_path_len];
 	char dbus_name[dbus_obj_path_len];
-	int dbus_poller = 0;
-	int fd;
 	int r;
 	size_t bytes;
 
 	if (!console) {
 		warnx("Couldn't get valid console");
-		return;
-	}
-
-	r = sd_bus_default_system(&console->bus);
-	if (r < 0) {
-		warnx("Failed to connect to system bus: %s", strerror(-r));
-		return;
+		return -1;
 	}
 
 	/* Register support console interface */
@@ -183,27 +222,28 @@ void dbus_init(struct console *console,
 	if (bytes >= dbus_obj_path_len) {
 		warnx("Console id '%s' is too long. There is no enough space in the buffer.",
 		      console->console_id);
-		return;
+		return -1;
 	}
 
-	if (console->tty.type == TTY_DEVICE_UART) {
+	if (console->server->tty.type == TTY_DEVICE_UART) {
 		/* Register UART interface */
-		r = sd_bus_add_object_vtable(console->bus, NULL, obj_name,
-					     UART_INTF, console_uart_vtable,
-					     console);
+		r = sd_bus_add_object_vtable(console->server->bus, NULL,
+					     obj_name, UART_INTF,
+					     console_uart_vtable, console);
 		if (r < 0) {
 			warnx("Failed to register UART interface: %s",
 			      strerror(-r));
-			return;
+			return -1;
 		}
 	}
 
 	/* Register access interface */
-	r = sd_bus_add_object_vtable(console->bus, NULL, obj_name, ACCESS_INTF,
-				     console_access_vtable, console);
+	r = sd_bus_add_object_vtable(console->server->bus, NULL, obj_name,
+				     ACCESS_INTF, console_access_vtable,
+				     console);
 	if (r < 0) {
 		warnx("Failed to issue method call: %s", strerror(-r));
-		return;
+		return -1;
 	}
 
 	bytes = snprintf(dbus_name, dbus_obj_path_len, DBUS_NAME,
@@ -211,26 +251,17 @@ void dbus_init(struct console *console,
 	if (bytes >= dbus_obj_path_len) {
 		warnx("Console id '%s' is too long. There is no enough space in the buffer.",
 		      console->console_id);
-		return;
+		return -1;
 	}
 
 	/* Finally register the bus name */
-	r = sd_bus_request_name(console->bus, dbus_name,
+	r = sd_bus_request_name(console->server->bus, dbus_name,
 				SD_BUS_NAME_ALLOW_REPLACEMENT |
 					SD_BUS_NAME_REPLACE_EXISTING);
 	if (r < 0) {
 		warnx("Failed to acquire service name: %s", strerror(-r));
-		return;
+		return -1;
 	}
 
-	fd = sd_bus_get_fd(console->bus);
-	if (fd < 0) {
-		warnx("Couldn't get the bus file descriptor");
-		return;
-	}
-
-	dbus_poller = POLLFD_DBUS;
-
-	console->pollfds[dbus_poller].fd = fd;
-	console->pollfds[dbus_poller].events = POLLIN;
+	return 0;
 }

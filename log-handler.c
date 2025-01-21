@@ -28,6 +28,7 @@
 #include <linux/types.h>
 
 #include "console-server.h"
+#include "config.h"
 
 struct log_handler {
 	struct handler handler;
@@ -62,7 +63,7 @@ static int log_trim(struct log_handler *lh)
 		/* don't return, as we need to re-open the logfile */
 	}
 
-	lh->fd = open(lh->log_filename, O_RDWR | O_CREAT | O_TRUNC, 0644);
+	lh->fd = open(lh->log_filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 	if (lh->fd < 0) {
 		warn("Can't open log buffer file %s", lh->log_filename);
 		return -1;
@@ -126,14 +127,43 @@ static enum ringbuffer_poll_ret log_ringbuffer_poll(void *arg, size_t force_len
 	return RINGBUFFER_POLL_OK;
 }
 
-static int log_init(struct handler *handler, struct console *console,
-		    struct config *config)
+static int log_create(struct log_handler *lh)
 {
-	struct log_handler *lh = to_log_handler(handler);
+	off_t pos;
+
+	lh->fd = open(lh->log_filename, O_WRONLY | O_CREAT | O_APPEND, 0644);
+	if (lh->fd < 0) {
+		warn("Can't open log buffer file %s", lh->log_filename);
+		return -1;
+	}
+	pos = lseek(lh->fd, 0, SEEK_END);
+	if (pos < 0) {
+		warn("Can't query log position for file %s", lh->log_filename);
+		close(lh->fd);
+		return -1;
+	}
+	lh->size = pos;
+	if ((size_t)pos >= lh->maxsize) {
+		return log_trim(lh);
+	}
+
+	return 0;
+}
+
+static struct handler *log_init(const struct handler_type *type
+				__attribute__((unused)),
+				struct console *console, struct config *config)
+{
+	struct log_handler *lh;
 	const char *filename;
 	const char *logsize_str;
 	size_t logsize = default_logsize;
 	int rc;
+
+	lh = malloc(sizeof(*lh));
+	if (!lh) {
+		return NULL;
+	}
 
 	lh->console = console;
 	lh->pagesize = 4096;
@@ -150,15 +180,15 @@ static int log_init(struct handler *handler, struct console *console,
 	}
 	lh->maxsize = logsize <= lh->pagesize ? lh->pagesize + 1 : logsize;
 
-	filename = config_get_value(config, "logfile");
-	if (!filename) {
-		filename = default_filename;
+	filename = config_get_section_value(config, console->console_id,
+					    "logfile");
+
+	if (!filename && config_count_sections(config) == 0) {
+		filename = config_get_value(config, "logfile");
 	}
 
-	lh->fd = open(filename, O_RDWR | O_CREAT | O_TRUNC, 0644);
-	if (lh->fd < 0) {
-		warn("Can't open log buffer file %s", filename);
-		return -1;
+	if (!filename) {
+		filename = default_filename;
 	}
 
 	lh->log_filename = strdup(filename);
@@ -166,13 +196,23 @@ static int log_init(struct handler *handler, struct console *console,
 	rc = asprintf(&lh->rotate_filename, "%s.1", filename);
 	if (rc < 0) {
 		warn("Failed to construct rotate filename");
-		return -1;
+		goto err_free;
 	}
 
+	rc = log_create(lh);
+	if (rc < 0) {
+		goto err_free;
+	}
 	lh->rbc = console_ringbuffer_consumer_register(console,
 						       log_ringbuffer_poll, lh);
 
-	return 0;
+	return &lh->handler;
+
+err_free:
+	free(lh->rotate_filename);
+	free(lh->log_filename);
+	free(lh);
+	return NULL;
 }
 
 static void log_fini(struct handler *handler)
@@ -182,14 +222,13 @@ static void log_fini(struct handler *handler)
 	close(lh->fd);
 	free(lh->log_filename);
 	free(lh->rotate_filename);
+	free(lh);
 }
 
-static struct log_handler log_handler = {
-	.handler = {
-		.name		= "log",
-		.init		= log_init,
-		.fini		= log_fini,
-	},
+static const struct handler_type log_handler = {
+	.name = "log",
+	.init = log_init,
+	.fini = log_fini,
 };
 
-console_handler_register(&log_handler.handler);
+console_handler_register(&log_handler);
