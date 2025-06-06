@@ -269,6 +269,15 @@ static uint8_t *process_buffer_range(struct socket_handler *sh, uint8_t *begin,
 	/* Caller to enforce */
 	assert(begin < end);
 
+#ifdef CONVERT_BACKSPACE
+	// Convert 0x7f to 0x08 for backspace compatibility with ANSI escape sequences
+	for (uint8_t *i = begin; i < end; i++) {
+		if (*i == 0x7f) {
+			*i = 0x08;
+		}
+	}
+#endif
+
 	/*
 	 * SSH-style escape sequence handling: <newline><leader><descriminator>
 	 *

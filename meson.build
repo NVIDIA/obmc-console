@@ -57,6 +57,10 @@ if get_option('console-log')
   log_handler_sources += 'log-handler.c'
 endif
 
+if get_option('convert-backspace')
+  add_project_arguments('-DCONVERT_BACKSPACE', language: 'c')
+endif
+
 executable('obmc-console-server',
            'config.c',
            'console-dbus.c',
