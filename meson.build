@@ -59,31 +59,43 @@ if udev.found()
     )
 endif
 
+log_handler_sources = []
+if get_option('console-log')
+    log_handler_sources += 'log-handler.c'
+endif
+
+if get_option('convert-backspace')
+    add_project_arguments('-DCONVERT_BACKSPACE', language: 'c')
+endif
+
 iniparser_dep = dependency('iniparser')
 
-server = executable('obmc-console-server',
-           'config.c',
-           'console-dbus.c',
-           'console-server.c',
-           'console-socket.c',
-           'console-mux.c',
-           'log-handler.c',
-           'ringbuffer.c',
-           'socket-handler.c',
-           'tty-handler.c',
-           'util.c',
-           c_args: [
-             '-DLOCALSTATEDIR="@0@"'.format(get_option('localstatedir')),
-             '-DSYSCONFDIR="@0@"'.format(get_option('sysconfdir'))
-           ],
-           dependencies: [
-             dependency('libsystemd'),
-             iniparser_dep,
-             dependency('libgpiod'),
-             meson.get_compiler('c').find_library('rt')
-           ],
-           install_dir: get_option('sbindir'),
-           install: true)
+server = executable(
+    'obmc-console-server',
+    'config.c',
+    'console-dbus.c',
+    'console-server.c',
+    'console-socket.c',
+    'console-mux.c',
+    'log-handler.c',
+    'ringbuffer.c',
+    'socket-handler.c',
+    'tty-handler.c',
+    'util.c',
+    log_handler_sources,
+    c_args: [
+        '-DLOCALSTATEDIR="@0@"'.format(get_option('localstatedir')),
+        '-DSYSCONFDIR="@0@"'.format(get_option('sysconfdir')),
+    ],
+    dependencies: [
+        dependency('libsystemd'),
+        iniparser_dep,
+        dependency('libgpiod'),
+        meson.get_compiler('c').find_library('rt'),
+    ],
+    install_dir: get_option('sbindir'),
+    install: true,
+)
 
 client = executable(
     'obmc-console-client',

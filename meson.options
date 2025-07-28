@@ -11,4 +11,15 @@ option(
     description: 'Support obmc-console-ssh and obmc-console-ssh-socket',
 )
 option('tests', type: 'boolean', description: 'Enable the test suite')
-option('console-log', type: 'boolean', value: true, description: 'Enable the console log in the obmc-console-server')
+option(
+    'console-log',
+    type: 'boolean',
+    value: true,
+    description: 'Enable the console log in the obmc-console-server',
+)
+option(
+    'convert-backspace',
+    type: 'boolean',
+    value: false,
+    description: 'Enable convert backspace sequence from 0x7f to 0x08',
+)
