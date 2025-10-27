@@ -265,6 +265,7 @@ static struct handler *tty_init(const struct handler_type *type
 
 	th = malloc(sizeof(*th));
 	if (!th) {
+		free(tty_path);
 		return NULL;
 	}
 

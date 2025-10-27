@@ -1032,7 +1032,7 @@ int run_server(struct console_server *server)
 	}
 	signal(SIGINT, sighandler_save);
 
-	return rc ? -1 : 0;
+	return -1;
 }
 
 static const struct option options[] = {
