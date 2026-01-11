@@ -1,0 +1,12 @@
+[Unit]
+Description=OpenBMC Console Archive Service
+
+[Service]
+Type=dbus
+BusName=xyz.openbmc_project.Console.ArchiveManager
+ExecStart=/usr/bin/obmc-console-archive-server
+SyslogIdentifier=obmc-console-archive
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

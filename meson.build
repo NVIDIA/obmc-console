@@ -23,6 +23,11 @@ install_data(
     rename: ['obmc-console@.service', 'obmc-console@.socket'],
     install_dir: systemdsystemunitdir,
 )
+install_data(
+    'conf/obmc-console-archive.service.in',
+    rename: ['obmc-console-archive.service'],
+    install_dir: systemdsystemunitdir,
+)
 if get_option('ssh').allowed()
     install_data(
         'conf/obmc-console-ssh@.service.in',
@@ -96,6 +101,15 @@ server = executable(
         meson.get_compiler('c').find_library('rt'),
     ],
     install_dir: get_option('sbindir'),
+    install: true,
+)
+
+archive_server = executable(
+    'obmc-console-archive-server',
+    'console-archive.c',
+    c_args: ['-DLOCALSTATEDIR="@0@"'.format(get_option('localstatedir'))],
+    dependencies: [dependency('libsystemd'), dependency('zlib')],
+    install_dir: get_option('bindir'),
     install: true,
 )
 
