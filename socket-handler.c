@@ -470,8 +470,7 @@ static struct handler *socket_init(const struct handler_type *type
 			goto err_free;
 		}
 
-		addrlen = sizeof(addr) - sizeof(addr.sun_path) + len;
-
+		addrlen = offsetof(struct sockaddr_un, sun_path) + len;
 		rc = bind(sh->sd, (struct sockaddr *)&addr, addrlen);
 		if (rc) {
 			socket_path_t name;
