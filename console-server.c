@@ -208,16 +208,6 @@ static int tty_find_device(struct console_server *server)
 		goto out_free;
 	}
 
-	rc = asprintf(&tty_device_reldir, "%s/../../", tty_device_tty_dir);
-	if (rc < 0) {
-		goto out_free;
-	}
-
-	tty_sysfs_devnode = realpath(tty_device_reldir, NULL);
-	if (!tty_sysfs_devnode) {
-		warn("Can't find parent device for %s", tty_kname_real);
-	}
-
 	rc = asprintf(&server->tty.dev, "/dev/%s", tty_kname_real);
 	if (rc < 0) {
 		goto out_free;
@@ -226,8 +216,49 @@ static int tty_find_device(struct console_server *server)
 	// Default to non-VUART
 	server->tty.type = TTY_DEVICE_UART;
 
-	/* Arbitrarily pick an attribute to differentiate UART vs VUART */
-	if (tty_sysfs_devnode) {
+	/* Prior to 6.8, we have the tty device directly under the platform
+	 * device:
+	 *
+	 *  1e787000.serial/lpc_address
+	 *  1e787000.serial/tty/ttySx/
+	 *
+	 * As of 6.8, those serial devices now use the port/serdev (:m.n)
+	 * layout reflected in the sysfs structure:
+	 *
+	 *  1e787000.serial/lpc_address
+	 *  1e787000.serial/1e787000.serial:0/1e787000.serial:0.0/tty/ttySx/
+	 *
+	 * - so we need to check for both
+	 */
+	const char *rel_dirs[] = {
+		"../../../../",
+		"../../",
+	};
+
+	for (unsigned int i = 0; i < (sizeof(rel_dirs) / sizeof(rel_dirs[0]));
+	     i++) {
+		const char *rel_dir = rel_dirs[i];
+
+		free(tty_device_reldir);
+		free(tty_sysfs_devnode);
+
+		rc = asprintf(&tty_device_reldir, "%s/%s", tty_device_tty_dir,
+			      rel_dir);
+		if (rc < 0) {
+			goto out_free;
+		}
+
+		tty_sysfs_devnode = realpath(tty_device_reldir, NULL);
+		/* not really an error, but it'd be unusual if we cannot
+		 * resolve two parent dirs...
+		 */
+		if (!tty_sysfs_devnode) {
+			warn("Can't find parent device for %s", tty_kname_real);
+			rc = 0;
+			goto out_free;
+		}
+
+		/* Arbitrarily pick an attribute to determine UART vs VUART */
 		rc = asprintf(&tty_vuart_lpc_addr, "%s/lpc_address",
 			      tty_sysfs_devnode);
 		if (rc < 0) {
@@ -239,6 +270,7 @@ static int tty_find_device(struct console_server *server)
 			server->tty.type = TTY_DEVICE_VUART;
 			server->tty.vuart.sysfs_devnode =
 				strdup(tty_sysfs_devnode);
+			break;
 		}
 	}
 
