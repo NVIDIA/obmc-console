@@ -42,6 +42,7 @@
 #define CONSOLE_LOG_DIR_CPU0 "/var/log/console_cpu0"
 #define CONSOLE_LOG_DIR_CPU1 "/var/log/console_cpu1"
 #define TEMP_ARCHIVE_TEMPLATE "/tmp/console_archive_%ld.tar.gz"
+#define USTAR_FILE_SIZE_MAX 077777777777ULL
 
 /* D-Bus error names */
 #define ERROR_NO_LOG_FILES_FOUND \
@@ -145,53 +146,106 @@ static int add_file_to_tar(FILE *tar_fp, const char *filepath,
     FILE *src_fp = NULL;
     char buffer[8192];
     size_t bytes_read;
+    off_t remaining;
     struct stat st;
+    int src_fd;
 
-    if (stat(filepath, &st) < 0) {
+    src_fd = open(filepath, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (src_fd < 0) {
         int saved_errno = errno;
-        warn("Failed to stat %s", filepath);
+        warn("Failed to open %s for reading", filepath);
         errno = saved_errno;
         return -1;
     }
 
-    if (write_tar_header(tar_fp, archive_name, &st) < 0) {
-        warnx("Failed to write tar header for %s", filepath);
+    src_fp = fdopen(src_fd, "rb");
+    if (!src_fp) {
+        int saved_errno = errno;
+        warn("Failed to create stream for %s", filepath);
+        close(src_fd);
+        errno = saved_errno;
         return -1;
     }
 
-    if (S_ISREG(st.st_mode)) {
-        src_fp = fopen(filepath, "rb");
-        if (!src_fp) {
-            int saved_errno = errno;
-            warn("Failed to open %s for reading", filepath);
+    if (fstat(src_fd, &st) < 0) {
+        int saved_errno = errno;
+        warn("Failed to stat open file %s", filepath);
+        fclose(src_fp);
+        errno = saved_errno;
+        return -1;
+    }
+
+    if (!S_ISREG(st.st_mode)) {
+        warnx("Refusing to archive non-regular file %s", filepath);
+        fclose(src_fp);
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (st.st_size < 0 || (uintmax_t)st.st_size > USTAR_FILE_SIZE_MAX) {
+        warnx("Refusing to archive %s: file too large for USTAR", filepath);
+        fclose(src_fp);
+        errno = EFBIG;
+        return -1;
+    }
+
+    errno = 0;
+    if (write_tar_header(tar_fp, archive_name, &st) < 0) {
+        int saved_errno = errno != 0 ? errno : EIO;
+        warnx("Failed to write tar header for %s", filepath);
+        fclose(src_fp);
+        errno = saved_errno;
+        return -1;
+    }
+
+    /* Copy exactly the size encoded in the TAR header even if the log grows */
+    remaining = st.st_size;
+    while (remaining > 0) {
+        size_t to_read = remaining > (off_t)sizeof(buffer)
+                             ? sizeof(buffer)
+                             : (size_t)remaining;
+
+        errno = 0;
+        bytes_read = fread(buffer, 1, to_read, src_fp);
+        if (bytes_read == 0) {
+            int saved_errno = errno != 0 ? errno : EIO;
+
+            if (ferror(src_fp)) {
+                warnx("Error reading %s", filepath);
+            } else {
+                warnx("Unexpected EOF while reading %s", filepath);
+            }
+            fclose(src_fp);
             errno = saved_errno;
             return -1;
         }
 
-        while ((bytes_read = fread(buffer, 1, sizeof(buffer), src_fp)) > 0) {
-            if (fwrite(buffer, 1, bytes_read, tar_fp) != bytes_read) {
-                warnx("Failed to write file content for %s", filepath);
-                fclose(src_fp);
-                return -1;
-            }
-        }
+        errno = 0;
+        if (fwrite(buffer, 1, bytes_read, tar_fp) != bytes_read) {
+            int saved_errno = errno != 0 ? errno : EIO;
 
-        if (ferror(src_fp)) {
-            warnx("Error reading %s", filepath);
+            warnx("Failed to write file content for %s", filepath);
             fclose(src_fp);
+            errno = saved_errno;
             return -1;
         }
 
-        fclose(src_fp);
+        remaining -= (off_t)bytes_read;
+    }
 
-        /* Pad to 512-byte boundary */
-        if (st.st_size % 512 != 0) {
-            size_t padding = 512 - (st.st_size % 512);
-            memset(buffer, 0, padding);
-            if (fwrite(buffer, 1, padding, tar_fp) != padding) {
-                warnx("Failed to write padding for %s", filepath);
-                return -1;
-            }
+    fclose(src_fp);
+
+    /* Pad to a 512-byte boundary using the size encoded in the TAR header */
+    if (st.st_size % 512 != 0) {
+        size_t padding = 512 - (st.st_size % 512);
+        memset(buffer, 0, padding);
+        errno = 0;
+        if (fwrite(buffer, 1, padding, tar_fp) != padding) {
+            int saved_errno = errno != 0 ? errno : EIO;
+
+            warnx("Failed to write padding for %s", filepath);
+            errno = saved_errno;
+            return -1;
         }
     }
 
@@ -249,7 +303,8 @@ static int add_directory_to_tar(FILE *tar_fp, const char *dirpath,
             warnx("Failed to add %s to archive", full_path);
             closedir(dir);
             if (saved_errno == EACCES || saved_errno == EPERM ||
-                saved_errno == ENOENT) {
+                saved_errno == ENOENT || saved_errno == EINVAL ||
+                saved_errno == EFBIG || saved_errno == ELOOP) {
                 return ADD_DIR_ERR_OPEN;
             }
             return ADD_DIR_ERR_WRITE;
