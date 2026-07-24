@@ -75,3 +75,45 @@ foreach ct : client_tests
         suite: 'itests',
     )
 endforeach
+
+test(
+    'test-log-handler',
+    executable(
+        'test-log-handler',
+        'test-log-handler.c',
+        '../config.c',
+        '../ringbuffer.c',
+        '../util.c',
+        dependencies: [iniparser_dep],
+        c_args: ['-DSYSCONFDIR=""', '-DLOCALSTATEDIR=""'],
+        include_directories: '..',
+    ),
+)
+
+test(
+    'test-text-log-handler',
+    executable(
+        'test-text-log-handler',
+        'test-text-log-handler.c',
+        '../config.c',
+        '../ringbuffer.c',
+        '../util.c',
+        dependencies: [iniparser_dep],
+        c_args: ['-DSYSCONFDIR=""', '-DLOCALSTATEDIR=""'],
+        include_directories: '..',
+    ),
+)
+
+test(
+    'test-console-socket-path',
+    executable(
+        'test-console-socket-path',
+        'test-console-socket-path.c',
+        '../console-socket.c',
+        c_args: [
+            '-DSYSCONFDIR=""',
+            '-DCONSOLE_SOCKET_PREFIX="obmc-console"',
+        ],
+        include_directories: '..',
+    ),
+)
