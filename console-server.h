@@ -53,6 +53,11 @@ struct handler_type {
 	void (*fini)(struct handler *handler);
 	int (*baudrate)(struct handler *handler, speed_t baudrate);
 	void (*deselect)(struct handler *handler);
+	/* Called after the shared upstream-TTY queue frees space. A handler
+	 * which paused one of its input producers can retry the exact retained
+	 * block and re-enable that producer without polling or blocking the main
+	 * event loop. */
+	void (*data_out_ready)(struct handler *handler);
 };
 
 struct handler {
@@ -76,7 +81,14 @@ struct handler {
 	_handler_name(__COUNTER__) = (h) + handler_type_check(h)
 /* NOLINTEND(bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp) */
 
-int console_data_out(struct console *console, const uint8_t *data, size_t len);
+enum console_data_out_ret {
+	CONSOLE_DATA_OUT_ERROR = -1,
+	CONSOLE_DATA_OUT_OK = 0,
+	CONSOLE_DATA_OUT_WOULD_BLOCK = 1,
+};
+
+enum console_data_out_ret console_data_out(struct console *console,
+					    const uint8_t *data, size_t len);
 
 enum poller_ret {
 	POLLER_OK = 0,
@@ -103,6 +115,13 @@ struct console_server {
 		const char *kname;
 		char *dev;
 		int fd;
+		/* Client input is copied here before it is written to the
+		 * nonblocking upstream TTY. The main poll loop drains this queue on
+		 * POLLOUT, so a stalled TX direction never stops target RX handling. */
+		uint8_t *tx_queue;
+		size_t tx_capacity;
+		size_t tx_head;
+		size_t tx_length;
 		enum tty_device type;
 		union {
 			struct {

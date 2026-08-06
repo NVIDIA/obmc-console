@@ -53,6 +53,36 @@ The server needs to know this because it needs to know what to name the pipe;
 the client needs to know it as it needs to form the abstract socket name to
 which to connect.
 
+### Input delivery and backpressure
+
+The server's main console descriptor is nonblocking. Client input is copied as
+a complete block into a bounded 64 KiB queue and the main event loop drains the
+queue whenever the descriptor reports `POLLOUT`. Positive short writes advance
+only by the accepted count; `EINTR` retries the same suffix; and `EAGAIN` leaves
+the suffix queued.
+
+```text
+console client input --> bounded TX queue --> POLLOUT --> upstream TTY
+                              |
+target TTY POLLIN ------------+---- processed first on every poll iteration
+                              |
+                        socket/TTY/DBus RX consumers
+```
+
+The event loop never waits for TX writability. It continues draining target RX,
+D-Bus, and console sockets while the opposite direction is backpressured. This
+is required for simultaneous RAS/firmware output and host-to-target commands.
+
+If the queue cannot admit a complete input block, that producer retains the
+block and temporarily removes only its `POLLIN` event. Physical-TTY progress
+notifies paused producers, which retry the retained block before accepting new
+input. This propagates bounded backpressure to socket and local-TTY writers
+without blocking the shared event loop or closing a healthy connection.
+
+Zero progress, hangup, and other terminal write failures remain visible
+delivery errors. No path consumes later input after an incomplete block,
+because doing so would turn backpressure into silent command truncation.
+
 ## Mux Support
 
 In some hardware designs, multiple UARTS may be available behind a Mux. Please

@@ -35,6 +35,9 @@ struct tty_handler {
 	int fd;
 	int fd_flags;
 	bool blocked;
+	bool input_blocked;
+	uint8_t pending[4096];
+	size_t pending_len;
 };
 
 static struct tty_handler *to_tty_handler(struct handler *handler)
@@ -66,22 +69,27 @@ static void tty_set_fd_blocking(struct tty_handler *th, bool fd_blocking)
  * POLLOUT indicates that the fd is no longer blocking, so we clear
  * blocked mode and can continue writing.
  */
+static void tty_update_events(struct tty_handler *th)
+{
+	int events = 0;
+
+	if (!th->input_blocked) {
+		events |= POLLIN;
+	}
+	if (th->blocked) {
+		events |= POLLOUT;
+	}
+	console_poller_set_events(th->console, th->poller, events);
+}
+
 static void tty_set_blocked(struct tty_handler *th, bool blocked)
 {
-	int events;
-
 	if (blocked == th->blocked) {
 		return;
 	}
 
 	th->blocked = blocked;
-	events = POLLIN;
-
-	if (th->blocked) {
-		events |= POLLOUT;
-	}
-
-	console_poller_set_events(th->console, th->poller, events);
+	tty_update_events(th);
 }
 
 static int tty_drain_queue(struct tty_handler *th, size_t force_len)
@@ -175,7 +183,19 @@ static enum poller_ret tty_poll(struct handler *handler, int events,
 			goto err;
 		}
 
-		console_data_out(th->console, buf, len);
+		/* Preserve the same delivery contract as socket clients: a local TTY
+		 * input block is complete only after the main console accepts every
+		 * byte.  A terminal failure removes this handler instead of silently
+		 * losing the block and continuing with later input. */
+		rc = console_data_out(th->console, buf, len);
+		if (rc == CONSOLE_DATA_OUT_WOULD_BLOCK) {
+			memcpy(th->pending, buf, (size_t)len);
+			th->pending_len = (size_t)len;
+			th->input_blocked = true;
+			tty_update_events(th);
+		} else if (rc == CONSOLE_DATA_OUT_ERROR) {
+			goto err;
+		}
 	}
 
 	if (events & POLLOUT) {
@@ -193,6 +213,25 @@ err:
 	close(th->fd);
 	ringbuffer_consumer_unregister(th->rbc);
 	return POLLER_REMOVE;
+}
+
+static void tty_data_out_ready(struct handler *handler)
+{
+	struct tty_handler *th = to_tty_handler(handler);
+	enum console_data_out_ret rc;
+
+	if (!th->input_blocked) {
+		return;
+	}
+
+	rc = console_data_out(th->console, th->pending, th->pending_len);
+	if (rc != CONSOLE_DATA_OUT_OK) {
+		return;
+	}
+
+	th->pending_len = 0;
+	th->input_blocked = false;
+	tty_update_events(th);
 }
 
 static int set_terminal_baud(struct tty_handler *th, const char *tty_name,
@@ -341,6 +380,7 @@ static const struct handler_type tty_handler = {
 	.init = tty_init,
 	.fini = tty_fini,
 	.baudrate = tty_baudrate,
+	.data_out_ready = tty_data_out_ready,
 };
 
 console_handler_register(&tty_handler);

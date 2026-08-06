@@ -48,6 +48,18 @@
 /* default size of the shared backlog ringbuffer */
 const size_t default_buffer_size = 128ul * 1024ul;
 
+/* Absorb short scheduler and PTY stalls without duplicating tcu_muxer's 4 MiB
+ * physical-UART queue.  Keeping this relay queue deliberately small makes
+ * socket flow control reach the producer promptly during sustained traffic,
+ * while the retained 4 KiB producer block still prevents byte loss.  A 64 KiB
+ * window is sixteen maximum input blocks and remains large enough to smooth
+ * normal command bursts without allowing one console to buffer an entire
+ * multi-megabyte workload ahead of the physical transport. */
+#define TTY_TX_QUEUE_SIZE (64ul * 1024ul)
+/* Even a continuously writable endpoint must yield to the rest of the event
+ * loop. Limiting one drain pass bounds RX/DBus/client scheduling latency. */
+#define TTY_TX_DRAIN_BUDGET (64ul * 1024ul)
+
 /* state shared with the signal handler */
 static volatile sig_atomic_t sigint;
 
@@ -344,9 +356,18 @@ static void tty_init_vuart_io(struct console_server *server)
 
 static int tty_init_io(struct console_server *server)
 {
+	server->tty.tx_queue = malloc(TTY_TX_QUEUE_SIZE);
+	if (!server->tty.tx_queue) {
+		warn("Can't allocate upstream TTY TX queue");
+		return -1;
+	}
+	server->tty.tx_capacity = TTY_TX_QUEUE_SIZE;
+
 	server->tty.fd = open(server->tty.dev, O_RDWR);
 	if (server->tty.fd <= 0) {
 		warn("Can't open tty %s", server->tty.dev);
+		free(server->tty.tx_queue);
+		server->tty.tx_queue = NULL;
 		return -1;
 	}
 
@@ -361,6 +382,8 @@ static int tty_init_io(struct console_server *server)
 		console_server_request_pollfd(server, server->tty.fd, POLLIN);
 
 	if (index < 0) {
+		free(server->tty.tx_queue);
+		server->tty.tx_queue = NULL;
 		return -1;
 	}
 
@@ -480,6 +503,11 @@ static void tty_fini(struct console_server *server)
 		free(server->tty.vuart.sysfs_devnode);
 	}
 
+	free(server->tty.tx_queue);
+	server->tty.tx_queue = NULL;
+	server->tty.tx_capacity = 0;
+	server->tty.tx_head = 0;
+	server->tty.tx_length = 0;
 	free(server->tty.dev);
 }
 
@@ -589,9 +617,110 @@ out_free_glob:
 	globfree(&globbuf);
 }
 
-int console_data_out(struct console *console, const uint8_t *data, size_t len)
+static void tty_tx_set_pollout(struct console_server *server, bool enabled)
 {
-	return write_buf_to_fd(console->server->tty.fd, data, len);
+	struct pollfd *pollfd = &server->pollfds[server->tty_pollfd_index];
+
+	pollfd->events = POLLIN | (enabled ? POLLOUT : 0);
+}
+
+/* Notify every producer only after the physical TTY has accepted bytes. This
+ * converts queue space into an event: paused socket/local-TTY inputs retry the
+ * one block they retained and resume POLLIN only after that block is queued. */
+static void tty_tx_notify_space(struct console_server *server)
+{
+	size_t i;
+
+	for (i = 0; i < server->n_consoles; i++) {
+		struct console *console = server->consoles[i];
+		long j;
+
+		for (j = 0; j < console->n_handlers; j++) {
+			struct handler *handler = console->handlers[j];
+
+			if (handler->type->data_out_ready) {
+				handler->type->data_out_ready(handler);
+			}
+		}
+	}
+}
+
+/* Drain only what the nonblocking TTY accepts immediately. EAGAIN leaves the
+ * exact suffix queued and returns to the main loop, which continues servicing
+ * target RX, D-Bus, and all console clients before poll() reports POLLOUT. */
+static int tty_tx_drain(struct console_server *server)
+{
+	size_t drained = 0;
+
+	while (server->tty.tx_length && drained < TTY_TX_DRAIN_BUDGET) {
+		size_t contiguous = server->tty.tx_capacity - server->tty.tx_head;
+		ssize_t rc;
+
+		if (contiguous > server->tty.tx_length) {
+			contiguous = server->tty.tx_length;
+		}
+		if (contiguous > TTY_TX_DRAIN_BUDGET - drained) {
+			contiguous = TTY_TX_DRAIN_BUDGET - drained;
+		}
+
+		rc = write(server->tty.fd,
+			   server->tty.tx_queue + server->tty.tx_head,
+			   contiguous);
+		if (rc > 0) {
+			server->tty.tx_head =
+				(server->tty.tx_head + (size_t)rc) %
+				server->tty.tx_capacity;
+			server->tty.tx_length -= (size_t)rc;
+			drained += (size_t)rc;
+			continue;
+		}
+		if (rc < 0 && errno == EINTR) {
+			continue;
+		}
+		if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+			tty_tx_set_pollout(server, true);
+			break;
+		}
+		if (rc == 0) {
+			warnx("Upstream TTY write made zero progress");
+		} else {
+			warn("Upstream TTY write failed");
+		}
+		return -1;
+	}
+
+	if (drained) {
+		tty_tx_notify_space(server);
+	}
+	tty_tx_set_pollout(server, server->tty.tx_length != 0);
+	return 0;
+}
+
+enum console_data_out_ret console_data_out(struct console *console,
+					    const uint8_t *data, size_t len)
+{
+	struct console_server *server = console->server;
+	size_t tail;
+	size_t first;
+
+	if (len > server->tty.tx_capacity - server->tty.tx_length) {
+		return CONSOLE_DATA_OUT_WOULD_BLOCK;
+	}
+
+	tail = (server->tty.tx_head + server->tty.tx_length) %
+		server->tty.tx_capacity;
+	first = server->tty.tx_capacity - tail;
+	if (first > len) {
+		first = len;
+	}
+	memcpy(server->tty.tx_queue + tail, data, first);
+	memcpy(server->tty.tx_queue, data + first, len - first);
+	server->tty.tx_length += len;
+
+	/* Draining in the next POLLOUT iteration keeps this call nonblocking and
+	 * prevents recursive producer callbacks when queue space is released. */
+	tty_tx_set_pollout(server, true);
+	return CONSOLE_DATA_OUT_OK;
 }
 
 /* Prepare a socket name */
@@ -952,6 +1081,7 @@ static int run_console_per_console(struct console *console, size_t buf_size,
 
 static int run_console_iteration(struct console_server *server)
 {
+	struct pollfd *tty_pollfd;
 	struct timeval tv;
 	uint8_t buf[4096];
 	long timeout;
@@ -980,8 +1110,10 @@ static int run_console_iteration(struct console_server *server)
 		return -1;
 	}
 
-	/* process internal fd first */
-	if (server->pollfds[server->tty_pollfd_index].revents) {
+	/* Process target RX before TX. A continuously writable TX descriptor must
+	 * never starve firmware output under simultaneous traffic. */
+	tty_pollfd = &server->pollfds[server->tty_pollfd_index];
+	if (tty_pollfd->revents & POLLIN) {
 		rc = read(server->tty.fd, buf, sizeof(buf));
 		if (rc <= 0) {
 			warn("Error reading from tty device");
@@ -992,6 +1124,17 @@ static int run_console_iteration(struct console_server *server)
 		if (rc) {
 			return -1;
 		}
+	}
+	if (tty_pollfd->revents & POLLOUT) {
+		rc = tty_tx_drain(server);
+		if (rc) {
+			return -1;
+		}
+	}
+	if (tty_pollfd->revents & (POLLERR | POLLHUP | POLLNVAL)) {
+		warnx("Upstream TTY reported terminal events 0x%x",
+		      tty_pollfd->revents);
+		return -1;
 	}
 
 	// process dbus

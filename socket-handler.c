@@ -42,7 +42,13 @@ struct client {
 	struct poller *poller;
 	struct ringbuffer_consumer *rbc;
 	int fd;
+	/* blocked tracks server-to-client socket backpressure. input_blocked is
+	 * independent: it pauses client-to-firmware reads while the shared
+	 * upstream-TTY queue is full. */
 	bool blocked;
+	bool input_blocked;
+	uint8_t pending[4096];
+	size_t pending_len;
 };
 
 struct socket_handler {
@@ -108,22 +114,28 @@ static void client_close(struct client *client)
 	/* NOLINTEND(bugprone-sizeof-expression) */
 }
 
-static void client_set_blocked(struct client *client, bool blocked)
+static void client_update_events(struct client *client)
 {
-	int events;
+	int events = 0;
 
-	if (client->blocked == blocked) {
-		return;
+	if (!client->input_blocked) {
+		events |= POLLIN;
 	}
-
-	client->blocked = blocked;
-
-	events = POLLIN;
 	if (client->blocked) {
 		events |= POLLOUT;
 	}
 
 	console_poller_set_events(client->sh->console, client->poller, events);
+}
+
+static void client_set_blocked(struct client *client, bool blocked)
+{
+	if (client->blocked == blocked) {
+		return;
+	}
+
+	client->blocked = blocked;
+	client_update_events(client);
 }
 
 static ssize_t send_all(struct client *client, void *buf, size_t len,
@@ -289,7 +301,23 @@ static enum poller_ret client_poll(struct handler *handler, int events,
 			goto err_close;
 		}
 
-		console_data_out(sh->console, buf, rc);
+		/* console_data_out() owns short-write and transient-backpressure
+		 * handling.  A terminal failure means the client command was not
+		 * delivered completely, so close this client instead of reading and
+		 * silently discarding more of its socket stream. */
+		enum console_data_out_ret out_rc;
+
+		out_rc = console_data_out(sh->console, buf, rc);
+		if (out_rc == CONSOLE_DATA_OUT_WOULD_BLOCK) {
+			/* recv() already consumed this block. Retain it exactly once and
+			 * stop reading this producer until the upstream queue makes room. */
+			memcpy(client->pending, buf, (size_t)rc);
+			client->pending_len = (size_t)rc;
+			client->input_blocked = true;
+			client_update_events(client);
+		} else if (out_rc == CONSOLE_DATA_OUT_ERROR) {
+			goto err_close;
+		}
 	}
 
 	if (events & POLLOUT) {
@@ -306,6 +334,37 @@ err_close:
 	client->poller = NULL;
 	client_close(client);
 	return POLLER_REMOVE;
+}
+
+static void socket_data_out_ready(struct handler *handler)
+{
+	struct socket_handler *sh = to_socket_handler(handler);
+	int i;
+
+	for (i = 0; i < sh->n_clients; i++) {
+		struct client *client = sh->clients[i];
+		enum console_data_out_ret rc;
+
+		if (!client->input_blocked) {
+			continue;
+		}
+
+		rc = console_data_out(sh->console, client->pending,
+				      client->pending_len);
+		if (rc == CONSOLE_DATA_OUT_WOULD_BLOCK) {
+			continue;
+		}
+		if (rc == CONSOLE_DATA_OUT_ERROR) {
+			warnx("Closing console client after terminal upstream TX failure");
+			client_close(client);
+			i--;
+			continue;
+		}
+
+		client->pending_len = 0;
+		client->input_blocked = false;
+		client_update_events(client);
+	}
 }
 
 static enum poller_ret socket_poll(struct handler *handler, int events,
@@ -534,6 +593,7 @@ static const struct handler_type socket_handler = {
 	.init = socket_init,
 	.deselect = socket_deselect,
 	.fini = socket_fini,
+	.data_out_ready = socket_data_out_ready,
 };
 
 console_handler_register(&socket_handler);

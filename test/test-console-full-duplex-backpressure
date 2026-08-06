@@ -1,0 +1,150 @@
+#!/usr/bin/sh
+
+set -eu
+
+SOCAT="$1"
+SERVER="$2"
+
+# The physical PTY is deliberately left unread while a client submits 8 MiB,
+# far beyond the server queue capacity. This forces upstream TTY backpressure
+# and producer backpressure. The helper retains direct ownership of the PTY
+# master so target RX remains independent from the deliberately blocked TX
+# direction.
+TEST_NAME="$(basename "$0" | tr '-' '_')"_${$}
+TEST_DIR="$(mktemp --tmpdir --directory "${TEST_NAME}.XXXXXX")"
+TARGET_PID=""
+SERVER_PID=""
+RX_PID=""
+TX_PID=""
+PTY_HELPER="$(realpath "$(dirname "$0")/test-full-duplex-pty")"
+
+cd "$TEST_DIR"
+
+cleanup()
+{
+  [ -z "$TX_PID" ] || kill "$TX_PID" 2>/dev/null || true
+  [ -z "$RX_PID" ] || kill "$RX_PID" 2>/dev/null || true
+  [ -z "$SERVER_PID" ] || kill "$SERVER_PID" 2>/dev/null || true
+  [ -z "$TARGET_PID" ] || kill "$TARGET_PID" 2>/dev/null || true
+  wait 2>/dev/null || true
+  cd - >/dev/null
+  rm -rf "$TEST_DIR"
+}
+
+trap cleanup EXIT
+
+cat > "${TEST_NAME}.conf" <<EOF
+active-console = $TEST_NAME
+[$TEST_NAME]
+console-id = $TEST_NAME
+EOF
+
+"$PTY_HELPER" &
+TARGET_PID="$!"
+remaining=100
+while ! [ -e local ]; do
+  kill -0 "$TARGET_PID" 2>/dev/null || {
+    echo "PTY helper exited before publishing the target endpoint" >&2
+    exit 1
+  }
+  if [ "$remaining" -eq 0 ]; then
+    echo "PTY helper did not publish the target endpoint" >&2
+    exit 1
+  fi
+  sleep 0.01
+  remaining=$((remaining - 1))
+done
+
+"$SERVER" --config "${TEST_NAME}.conf" "$(realpath local)" &
+SERVER_PID="$!"
+remaining=10
+until busctl status --user xyz.openbmc_project.Console."${TEST_NAME}" \
+    >/dev/null 2>&1; do
+  # A startup failure must not leave the test waiting forever. Checking both
+  # the process and a finite deadline distinguishes an exited server from a
+  # D-Bus registration that is merely still in progress.
+  kill -0 "$SERVER_PID" 2>/dev/null || {
+    echo "console server exited before registering on D-Bus" >&2
+    wait "$SERVER_PID" || true
+    exit 1
+  }
+  if [ "$remaining" -eq 0 ]; then
+    echo "console server did not register on D-Bus within 10 seconds" >&2
+    exit 1
+  fi
+  sleep 1
+  remaining=$((remaining - 1))
+done
+
+# Connect the RX observer before filling TX so it cannot miss the marker.
+"$SOCAT" -u "ABSTRACT:obmc-console.${TEST_NAME}" \
+  EXEC:'grep -m1 -qF FULL_DUPLEX_RX_ALIVE' &
+RX_PID="$!"
+sleep 1
+
+# The far endpoint remains unread here. Once its kernel PTY buffer fills, the
+# server must retain the suffix and return to its poll loop rather than waiting.
+dd if=/dev/zero bs=1048576 count=8 2>/dev/null | \
+  "$SOCAT" -u - "ABSTRACT:obmc-console.${TEST_NAME}" &
+TX_PID="$!"
+sleep 1
+touch inject
+remaining=100
+while ! [ -e injected ]; do
+  kill -0 "$TARGET_PID" 2>/dev/null || {
+    echo "PTY helper exited before injecting target RX" >&2
+    exit 1
+  }
+  if [ "$remaining" -eq 0 ]; then
+    echo "PTY helper did not inject target RX" >&2
+    exit 1
+  fi
+  sleep 0.01
+  remaining=$((remaining - 1))
+done
+
+# Three seconds is intentionally below the old five-second no-progress wait.
+# Therefore success proves RX progressed while the opposite direction was
+# backpressured, not merely after the synchronous timeout expired.
+remaining=3
+while kill -0 "$RX_PID" 2>/dev/null && [ "$remaining" -gt 0 ]; do
+  sleep 1
+  remaining=$((remaining - 1))
+done
+if kill -0 "$RX_PID" 2>/dev/null; then
+  echo "firmware RX stalled behind upstream TX backpressure" >&2
+  exit 1
+fi
+wait "$RX_PID"
+RX_PID=""
+kill -0 "$SERVER_PID"
+
+# Drain the simulated target only after the RX assertion. This lets the queued
+# 8 MiB complete and proves the retained input block and queued suffix remain
+# usable after backpressure clears.
+touch drain
+remaining=100
+while ! [ -e draining ]; do
+  kill -0 "$TARGET_PID" 2>/dev/null || {
+    echo "PTY helper exited before draining target TX" >&2
+    exit 1
+  }
+  if [ "$remaining" -eq 0 ]; then
+    echo "PTY helper did not start draining target TX" >&2
+    exit 1
+  fi
+  sleep 0.01
+  remaining=$((remaining - 1))
+done
+
+remaining=1000
+while kill -0 "$TX_PID" 2>/dev/null && [ "$remaining" -gt 0 ]; do
+  sleep 0.01
+  remaining=$((remaining - 1))
+done
+if kill -0 "$TX_PID" 2>/dev/null; then
+  echo "console client remained blocked after target TX resumed" >&2
+  exit 1
+fi
+wait "$TX_PID"
+TX_PID=""

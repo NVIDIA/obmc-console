@@ -47,6 +47,7 @@ server_tests = [
     'test-console-logs-to-file-no-sections',
     'test-console-socket-read',
     'test-console-socket-write',
+    'test-console-full-duplex-backpressure',
     'test-multiple-consoles',
 ]
 
