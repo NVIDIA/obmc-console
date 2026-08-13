@@ -117,6 +117,11 @@ static int write_tar_header(FILE *tar_fp, const char *archive_name,
 
     memset(&header, 0, sizeof(header));
 
+    /* Fail rather than silently truncate a name that won't fit the header */
+    if (strlen(archive_name) >= sizeof(header.name)) {
+        warnx("Archive entry name too long, skipping: %s", archive_name);
+        return -1;
+    }
     strncpy(header.name, archive_name, sizeof(header.name) - 1);
     snprintf(header.mode, sizeof(header.mode), "%07o",
              st->st_mode & 07777);
