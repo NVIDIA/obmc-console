@@ -28,11 +28,11 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <time.h>
 #include <unistd.h>
 #include <zlib.h>
 
 #include <systemd/sd-bus.h>
+
 
 #define ARCHIVE_INTF        "xyz.openbmc_project.Console.Archive"
 #define ARCHIVE_OBJ_PATH    "/xyz/openbmc_project/console"
@@ -41,7 +41,6 @@
 
 #define CONSOLE_LOG_DIR_CPU0 "/var/log/console_cpu0"
 #define CONSOLE_LOG_DIR_CPU1 "/var/log/console_cpu1"
-#define TEMP_ARCHIVE_TEMPLATE "/tmp/console_archive_%ld.tar.gz"
 #define USTAR_FILE_SIZE_MAX 077777777777ULL
 
 /* D-Bus error names */
@@ -334,46 +333,31 @@ static int add_directory_to_tar(FILE *tar_fp, const char *dirpath,
  */
 static int create_archive(char *archive_path_out, size_t path_size)
 {
-    char archive_path[256];
-    char temp_tar_path[512];
+    /* Randomized temp paths — mkstemps creates with O_EXCL, no TOCTOU */
+    char archive_path[] = "/tmp/console_archive_XXXXXX.tar.gz";
+    char temp_tar_path[] = "/tmp/console_archive_XXXXXX.tar";
     FILE *tar_fp = NULL;
     gzFile gz_fp = NULL;
-    FILE *final_fp = NULL;
     int archive_fd = -1;
-    int rc;
-    time_t now;
     char buffer[8192];
     size_t bytes_read;
     struct stat st_cpu0;
     struct stat st_cpu1;
     bool files_added = false;
 
-    now = time(NULL);
-    rc = snprintf(archive_path, sizeof(archive_path),
-                  TEMP_ARCHIVE_TEMPLATE, (long)now);
-    if (rc < 0 || (size_t)rc >= sizeof(archive_path)) {
-        warnx("Failed to construct archive path");
-        return ARCHIVE_ERROR_INTERNAL;
-    }
-
-    size_t path_len = strlen(archive_path);
-    if (path_len >= 7 &&
-        strcmp(archive_path + path_len - 7, ".tar.gz") == 0) {
-        snprintf(temp_tar_path, sizeof(temp_tar_path), "%.*s.tar",
-                 (int)(path_len - 7), archive_path);
-    } else {
-        snprintf(temp_tar_path, sizeof(temp_tar_path),
-                 "%s.tar", archive_path);
-    }
-
-    tar_fp = fopen(temp_tar_path, "wb");
-    if (!tar_fp) {
-        int saved_errno = errno;
-        warn("Failed to create temporary tar file %s", temp_tar_path);
-        if (saved_errno == EACCES || saved_errno == EPERM) {
-            return ARCHIVE_ERROR_FILE_OPEN;
+    {
+        int tar_fd = mkstemps(temp_tar_path, 4); /* 4 = strlen(".tar") */
+        if (tar_fd < 0) {
+            warn("Failed to create temporary tar file");
+            return ARCHIVE_ERROR_INTERNAL;
         }
-        return ARCHIVE_ERROR_FILE_WRITE;
+        tar_fp = fdopen(tar_fd, "wb");
+        if (!tar_fp) {
+            close(tar_fd);
+            unlink(temp_tar_path);
+            warn("fdopen failed for temporary tar file");
+            return ARCHIVE_ERROR_INTERNAL;
+        }
     }
 
     /* Add console_cpu0 directory if it exists */
@@ -430,26 +414,23 @@ static int create_archive(char *archive_path_out, size_t path_size)
         return ARCHIVE_ERROR_INTERNAL;
     }
 
-    final_fp = fopen(archive_path, "wb");
-    if (!final_fp) {
-        int saved_errno = errno;
-        warn("Failed to create archive file %s", archive_path);
-        fclose(tar_fp);
-        unlink(temp_tar_path);
-        if (saved_errno == EACCES || saved_errno == EPERM) {
-            return ARCHIVE_ERROR_FILE_OPEN;
+    {
+        int gz_fd = mkstemps(archive_path, 7); /* 7 = strlen(".tar.gz") */
+        if (gz_fd < 0) {
+            warn("Failed to create archive file");
+            fclose(tar_fp);
+            unlink(temp_tar_path);
+            return ARCHIVE_ERROR_INTERNAL;
         }
-        return ARCHIVE_ERROR_FILE_WRITE;
-    }
-
-    gz_fp = gzdopen(fileno(final_fp), "wb");
-    if (!gz_fp) {
-        warn("Failed to open gzip stream");
-        fclose(tar_fp);
-        fclose(final_fp);
-        unlink(temp_tar_path);
-        unlink(archive_path);
-        return ARCHIVE_ERROR_INTERNAL;
+        gz_fp = gzdopen(gz_fd, "wb");
+        if (!gz_fp) {
+            warn("Failed to open gzip stream");
+            close(gz_fd);
+            fclose(tar_fp);
+            unlink(temp_tar_path);
+            unlink(archive_path);
+            return ARCHIVE_ERROR_INTERNAL;
+        }
     }
 
     while ((bytes_read = fread(buffer, 1, sizeof(buffer), tar_fp)) > 0) {
@@ -499,6 +480,31 @@ static int create_archive(char *archive_path_out, size_t path_size)
     return archive_fd;
 }
 
+/* Returns 0 when the caller is authorized, or a negative errno. */
+static int consoleCheckCaller(sd_bus_message *msg)
+{
+    sd_bus_creds *creds = NULL;
+    uid_t uid;
+    int rc;
+
+    rc = sd_bus_query_sender_creds(msg, SD_BUS_CREDS_UID, &creds);
+    if (rc < 0) {
+        return rc;
+    }
+
+    if (!creds) {
+        return -EPERM;
+    }
+
+    rc = sd_bus_creds_get_uid(creds, &uid);
+    sd_bus_creds_unref(creds);
+    if (rc < 0) {
+        return rc;
+    }
+
+    return (uid == 0 || uid == geteuid()) ? 0 : -EPERM;
+}
+
 static int method_get_log(sd_bus_message *msg, void *userdata,
                           sd_bus_error *err)
 {
@@ -509,6 +515,15 @@ static int method_get_log(sd_bus_message *msg, void *userdata,
     if (!ctx || !ctx->bus) {
         sd_bus_error_set_const(err, ERROR_INTERNAL_FAILURE,
                                "Internal error: Invalid context");
+        return sd_bus_reply_method_error(msg, err);
+    }
+
+    rc = consoleCheckCaller(msg);
+    if (rc < 0) {
+        warnx("Rejected unauthorized console GetLog request");
+        sd_bus_error_set_const(
+            err, SD_BUS_ERROR_ACCESS_DENIED,
+            "Unauthorized: console log access requires root");
         return sd_bus_reply_method_error(msg, err);
     }
 

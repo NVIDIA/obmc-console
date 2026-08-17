@@ -19,6 +19,7 @@
 #include <err.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 #include "config.h"
 #include "console-mux.h"
@@ -58,10 +59,35 @@ static void tty_change_baudrate(struct console *console)
 	}
 }
 
+/* Returns 0 when the caller is authorized, or a negative errno. */
+static int consoleCheckCaller(sd_bus_message *msg)
+{
+	sd_bus_creds *creds = NULL;
+	uid_t uid;
+	int rc;
+
+	rc = sd_bus_query_sender_creds(msg, SD_BUS_CREDS_UID, &creds);
+	if (rc < 0) {
+		return rc;
+	}
+
+	if (!creds) {
+		return -EPERM;
+	}
+
+	rc = sd_bus_creds_get_uid(creds, &uid);
+	sd_bus_creds_unref(creds);
+	if (rc < 0) {
+		return rc;
+	}
+
+	return (uid == 0 || uid == geteuid()) ? 0 : -EPERM;
+}
+
 static int set_baud_handler(sd_bus *bus, const char *path,
 			    const char *interface, const char *property,
 			    sd_bus_message *msg, void *userdata,
-			    sd_bus_error *err __attribute__((unused)))
+			    sd_bus_error *err)
 {
 	struct console *console = userdata;
 	uint64_t baudrate;
@@ -70,6 +96,12 @@ static int set_baud_handler(sd_bus *bus, const char *path,
 
 	if (!console) {
 		return -ENOENT;
+	}
+
+	r = consoleCheckCaller(msg);
+	if (r < 0) {
+		warnx("Rejected unauthorized attempt to set console baud rate");
+		return sd_bus_error_set_errno(err, r);
 	}
 
 	r = sd_bus_message_read(msg, "t", &baudrate);
@@ -125,6 +157,13 @@ static int method_connect(sd_bus_message *msg, void *userdata,
 	if (!console) {
 		warnx("Internal error: Console pointer is null");
 		sd_bus_error_set_const(err, DBUS_ERR, "Internal error");
+		return sd_bus_reply_method_error(msg, err);
+	}
+
+	rc = consoleCheckCaller(msg);
+	if (rc < 0) {
+		warnx("Rejected unauthorized console Connect request");
+		sd_bus_error_set_errno(err, rc);
 		return sd_bus_reply_method_error(msg, err);
 	}
 
