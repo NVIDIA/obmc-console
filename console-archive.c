@@ -475,29 +475,12 @@ static int create_archive(char *archive_path_out, size_t path_size)
     return archive_fd;
 }
 
-/* Returns 0 when the caller is authorized, or a negative errno. */
+/* Returns > 0 when the caller is authorized, 0 when it is not, and a
+ * negative errno when the privilege check itself could not be performed.
+ */
 static int consoleCheckCaller(sd_bus_message *msg)
 {
-    sd_bus_creds *creds = NULL;
-    uid_t uid;
-    int rc;
-
-    rc = sd_bus_query_sender_creds(msg, SD_BUS_CREDS_UID, &creds);
-    if (rc < 0) {
-        return rc;
-    }
-
-    if (!creds) {
-        return -EPERM;
-    }
-
-    rc = sd_bus_creds_get_uid(creds, &uid);
-    sd_bus_creds_unref(creds);
-    if (rc < 0) {
-        return rc;
-    }
-
-    return (uid == 0 || uid == geteuid()) ? 0 : -EPERM;
+    return sd_bus_query_sender_privilege(msg, -1);
 }
 
 static int method_get_log(sd_bus_message *msg, void *userdata,
@@ -515,10 +498,16 @@ static int method_get_log(sd_bus_message *msg, void *userdata,
 
     rc = consoleCheckCaller(msg);
     if (rc < 0) {
+        warnx("Cannot determine caller privilege for GetLog: %s",
+              strerror(-rc));
+        sd_bus_error_set_errno(err, rc);
+        return sd_bus_reply_method_error(msg, err);
+    }
+    if (rc == 0) {
         warnx("Rejected unauthorized console GetLog request");
         sd_bus_error_set_const(
             err, SD_BUS_ERROR_ACCESS_DENIED,
-            "Unauthorized: console log access requires root");
+            "Unauthorized: console log access requires privilege");
         return sd_bus_reply_method_error(msg, err);
     }
 
