@@ -19,6 +19,7 @@
 #include <err.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 #include "config.h"
 #include "console-mux.h"
@@ -58,10 +59,18 @@ static void tty_change_baudrate(struct console *console)
 	}
 }
 
+/* Returns > 0 when the caller is authorized, 0 when it is not, and a
+ * negative errno when the privilege check itself could not be performed.
+ */
+static int consoleCheckCaller(sd_bus_message *msg)
+{
+	return sd_bus_query_sender_privilege(msg, -1);
+}
+
 static int set_baud_handler(sd_bus *bus, const char *path,
 			    const char *interface, const char *property,
 			    sd_bus_message *msg, void *userdata,
-			    sd_bus_error *err __attribute__((unused)))
+			    sd_bus_error *err)
 {
 	struct console *console = userdata;
 	uint64_t baudrate;
@@ -70,6 +79,19 @@ static int set_baud_handler(sd_bus *bus, const char *path,
 
 	if (!console) {
 		return -ENOENT;
+	}
+
+	r = consoleCheckCaller(msg);
+	if (r < 0) {
+		warnx("Cannot determine caller privilege for Baud: %s",
+		      strerror(-r));
+		return sd_bus_error_set_errno(err, r);
+	}
+	if (r == 0) {
+		warnx("Rejected unauthorized attempt to set console baud rate");
+		return sd_bus_error_set_const(err, SD_BUS_ERROR_ACCESS_DENIED,
+					      "Unauthorized: setting the baud "
+					      "rate requires privilege");
 	}
 
 	r = sd_bus_message_read(msg, "t", &baudrate);
@@ -125,6 +147,21 @@ static int method_connect(sd_bus_message *msg, void *userdata,
 	if (!console) {
 		warnx("Internal error: Console pointer is null");
 		sd_bus_error_set_const(err, DBUS_ERR, "Internal error");
+		return sd_bus_reply_method_error(msg, err);
+	}
+
+	rc = consoleCheckCaller(msg);
+	if (rc < 0) {
+		warnx("Cannot determine caller privilege for Connect: %s",
+		      strerror(-rc));
+		sd_bus_error_set_errno(err, rc);
+		return sd_bus_reply_method_error(msg, err);
+	}
+	if (rc == 0) {
+		warnx("Rejected unauthorized console Connect request");
+		sd_bus_error_set_const(
+			err, SD_BUS_ERROR_ACCESS_DENIED,
+			"Unauthorized: console access requires privilege");
 		return sd_bus_reply_method_error(msg, err);
 	}
 

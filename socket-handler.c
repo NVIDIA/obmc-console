@@ -17,6 +17,7 @@
 #include <assert.h>
 #include <err.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -36,6 +37,8 @@
 #define SOCKET_HANDLER_PKT_SIZE 512
 /* Set poll() timeout to 4000 uS, or 4 mS */
 #define SOCKET_HANDLER_PKT_US_TIMEOUT 4000
+/* Upper bound on concurrent clients, shared by socket and D-Bus paths */
+static const int socketHandlerMaxClients = 16;
 
 struct client {
 	struct socket_handler *sh;
@@ -50,6 +53,8 @@ struct socket_handler {
 	struct console *console;
 	struct poller *poller;
 	int sd;
+	/* Reserved fd so accept() can drain the queue even under EMFILE */
+	int spare_fd;
 
 	struct client **clients;
 	int n_clients;
@@ -68,6 +73,7 @@ static struct socket_handler *to_socket_handler(struct handler *handler)
 static void client_close(struct client *client)
 {
 	struct socket_handler *sh = client->sh;
+	struct client **clients;
 	int idx;
 
 	close(client->fd);
@@ -102,8 +108,12 @@ static void client_close(struct client *client)
 		free(sh->clients);
 		sh->clients = NULL;
 	} else {
-		sh->clients = reallocarray(sh->clients, sh->n_clients,
-					   sizeof(*sh->clients));
+		clients = reallocarray(sh->clients, sh->n_clients,
+				       sizeof(*sh->clients));
+		/* On failure keep the existing, larger allocation */
+		if (clients) {
+			sh->clients = clients;
+		}
 	}
 	/* NOLINTEND(bugprone-sizeof-expression) */
 }
@@ -312,11 +322,34 @@ static enum poller_ret socket_poll(struct handler *handler, int events,
 				   void __attribute__((unused)) * data)
 {
 	struct socket_handler *sh = to_socket_handler(handler);
+	struct ucred peerCred;
+	socklen_t peerCredLen = sizeof(peerCred);
+	struct client **clients;
 	struct client *client;
 	int fd;
-	int n;
 
 	if (!(events & POLLIN)) {
+		return POLLER_OK;
+	}
+
+	if (sh->n_clients >= socketHandlerMaxClients) {
+		/* Free one slot so accept() is guaranteed to succeed */
+		close(sh->spare_fd);
+		fd = accept(sh->sd, NULL, NULL);
+		if (fd >= 0) {
+			warnx("Rejected console connection: client limit "
+			      "(%d) reached",
+			      socketHandlerMaxClients);
+			close(fd);
+		} else {
+			warn("accept() failed despite spare fd; "
+			     "busy-poll possible");
+		}
+		/* Reclaim the slot */
+		sh->spare_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+		if (sh->spare_fd < 0) {
+			warn("Failed to restore spare fd");
+		}
 		return POLLER_OK;
 	}
 
@@ -325,9 +358,30 @@ static enum poller_ret socket_poll(struct handler *handler, int events,
 		return POLLER_OK;
 	}
 
+	/* The abstract-namespace socket has no filesystem permissions */
+	if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peerCred, &peerCredLen) <
+	    0) {
+		warn("Failed to read peer credentials; rejecting connection");
+		close(fd);
+		return POLLER_OK;
+	}
+
+	/* Root, or a peer running as the server's own user */
+	if (peerCred.uid != 0 && peerCred.uid != geteuid()) {
+		warnx("Rejected console connection from uid %u (pid %d)",
+		      (unsigned int)peerCred.uid, (int)peerCred.pid);
+		close(fd);
+		return POLLER_OK;
+	}
+
 	console_mux_activate(sh->console);
 
 	client = malloc(sizeof(*client));
+	if (!client) {
+		warnx("Failed to allocate client structure.");
+		close(fd);
+		return POLLER_OK;
+	}
 	memset(client, 0, sizeof(*client));
 
 	client->sh = sh;
@@ -337,17 +391,37 @@ static enum poller_ret socket_poll(struct handler *handler, int events,
 						 client->fd, POLLIN, client);
 	client->rbc = console_ringbuffer_consumer_register(
 		sh->console, client_ringbuffer_poll, client);
+	if (!client->rbc) {
+		warnx("Failed to register a consumer.");
+		if (client->poller) {
+			console_poller_unregister(sh->console, client->poller);
+		}
+		free(client);
+		close(fd);
+		return POLLER_OK;
+	}
 
-	n = sh->n_clients++;
 	/*
 	 * We're managing an array of pointers to aggregates, so don't warn about sizeof() on a
 	 * pointer type.
 	 */
 	/* NOLINTBEGIN(bugprone-sizeof-expression) */
-	sh->clients =
-		reallocarray(sh->clients, sh->n_clients, sizeof(*sh->clients));
+	clients = reallocarray(sh->clients, sh->n_clients + 1,
+			       sizeof(*sh->clients));
 	/* NOLINTEND(bugprone-sizeof-expression) */
-	sh->clients[n] = client;
+	if (!clients) {
+		warn("Failed to grow client array");
+		/* sh->clients still holds the previous allocation */
+		if (client->poller) {
+			console_poller_unregister(sh->console, client->poller);
+		}
+		ringbuffer_consumer_unregister(client->rbc);
+		free(client);
+		close(fd);
+		return POLLER_OK;
+	}
+	sh->clients = clients;
+	sh->clients[sh->n_clients++] = client;
 
 	return POLLER_OK;
 }
@@ -359,11 +433,11 @@ static enum poller_ret socket_poll(struct handler *handler, int events,
 int dbus_create_socket_consumer(struct console *console)
 {
 	struct socket_handler *sh = NULL;
+	struct client **clients;
 	struct client *client;
 	int fds[2];
 	int i;
 	int rc = -1;
-	int n;
 
 	for (i = 0; i < console->n_handlers; i++) {
 		if (strcmp(console->handlers[i]->type->name, "socket") == 0) {
@@ -374,6 +448,13 @@ int dbus_create_socket_consumer(struct console *console)
 
 	if (!sh) {
 		return -ENOSYS;
+	}
+
+	/* The client bound is shared with the socket accept path */
+	if (sh->n_clients >= socketHandlerMaxClients) {
+		warnx("Rejected console consumer: client limit (%d) reached",
+		      socketHandlerMaxClients);
+		return -EBUSY;
 	}
 
 	/* Create a socketpair */
@@ -404,17 +485,26 @@ int dbus_create_socket_consumer(struct console *console)
 		goto free_client;
 	}
 
-	n = sh->n_clients++;
-
 	/*
 	 * We're managing an array of pointers to aggregates, so don't warn about
 	 * sizeof() on a pointer type.
 	 */
 	/* NOLINTBEGIN(bugprone-sizeof-expression) */
-	sh->clients =
-		reallocarray(sh->clients, sh->n_clients, sizeof(*sh->clients));
+	clients = reallocarray(sh->clients, sh->n_clients + 1,
+			       sizeof(*sh->clients));
 	/* NOLINTEND(bugprone-sizeof-expression) */
-	sh->clients[n] = client;
+	if (!clients) {
+		warn("Failed to grow client array");
+		/* sh->clients still holds the previous allocation */
+		if (client->poller) {
+			console_poller_unregister(sh->console, client->poller);
+		}
+		ringbuffer_consumer_unregister(client->rbc);
+		rc = -ENOMEM;
+		goto free_client;
+	}
+	sh->clients = clients;
+	sh->clients[sh->n_clients++] = client;
 
 	/* Return the second FD to caller. */
 	return fds[1];
@@ -447,6 +537,12 @@ static struct handler *socket_init(const struct handler_type *type
 	sh->console = console;
 	sh->clients = NULL;
 	sh->n_clients = 0;
+
+	sh->spare_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+	if (sh->spare_fd < 0) {
+		/* Non-fatal, but EMFILE busy-poll protection is lost */
+		warn("Failed to open spare fd");
+	}
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
@@ -522,6 +618,10 @@ static void socket_fini(struct handler *handler)
 
 	if (sh->poller) {
 		console_poller_unregister(sh->console, sh->poller);
+	}
+
+	if (sh->spare_fd >= 0) {
+		close(sh->spare_fd);
 	}
 
 	close(sh->sd);
