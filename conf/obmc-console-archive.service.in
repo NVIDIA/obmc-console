@@ -2,7 +2,7 @@
 Description=OpenBMC Console Archive Service
 
 [Service]
-Type=dbus
+Type=simple
 BusName=xyz.openbmc_project.Console.ArchiveManager
 ExecStart=/usr/bin/obmc-console-archive-server
 SyslogIdentifier=obmc-console-archive
