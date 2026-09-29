@@ -1,12 +1,7 @@
 [Unit]
 Description=Console server domain socket listener
-# Boot-time fix, edited directly (2026-09-18 base fix + 2026-09-28
-# follow-up, converted from .socket.d/ drop-ins to a direct source edit
-# via `devtool modify obmc-console`): same rationale as the per-channel
-# obmc-console-VSERn.socket static files (see meta-vr-nvl-bmc's
-# recipes-phosphor/console/obmc-console/systemd/ directory) -- this is
-# the paired domain-socket side, a real systemd template so one edit here
-# covers all 31 obmc-console@VSERn.socket instances.
+# DefaultDependencies=no + defer past bmc-boot-complete.service, same as
+# the paired obmc-console-VSERn.socket per-channel files.
 DefaultDependencies=no
 Requires=sysinit.target
 After=sysinit.target bmc-boot-complete.service
