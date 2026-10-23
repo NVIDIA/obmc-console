@@ -23,11 +23,11 @@
 
 #include "util.h"
 
-static ssize_t __read(int fd, void *buf, size_t len);
-#define read __read
+static ssize_t test_read(int fd, void *buf, size_t len);
+#define read test_read
 #include "config.c"
 #include "console-socket.c"
-#define main __main
+#define main client_main
 #include "console-client.c"
 #undef read
 #undef main
@@ -169,7 +169,7 @@ int write_buf_to_fd(int fd, const uint8_t *buf, size_t len)
 	return 0;
 }
 
-static ssize_t __read(int fd, void *buf, size_t len)
+static ssize_t test_read(int fd, void *buf, size_t len)
 {
 	struct test_ctx *ctx = &ctxs[fd];
 	const char *inbuf;
