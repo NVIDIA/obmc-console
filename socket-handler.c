@@ -425,14 +425,6 @@ static enum poller_ret socket_poll(struct handler *handler, int events,
 		return POLLER_OK;
 	}
 
-	/* Root, or a peer running as the server's own user */
-	if (peerCred.uid != 0 && peerCred.uid != geteuid()) {
-		warnx("Rejected console connection from uid %u (pid %d)",
-		      (unsigned int)peerCred.uid, (int)peerCred.pid);
-		close(fd);
-		return POLLER_OK;
-	}
-
 	console_mux_activate(sh->console);
 
 	client = malloc(sizeof(*client));
